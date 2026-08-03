@@ -8,7 +8,7 @@ const FIXTURES        = path.join(PROJECT_ROOT, 'test', 'fixtures');
 
 function warden(args: string[], timeoutMs = 10_000) {
   const result = spawnSync('node', [CLI, ...args], {
-    cwd: PROJECT_ROOT,
+    cwd: FIXTURES,
     encoding: 'utf8',
     timeout: timeoutMs,
   });

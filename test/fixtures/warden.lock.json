@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "generatedAt": "2026-08-03T00:00:00.000Z",
+  "packages": {
+    "warden-test-clean@1.0.0": {
+      "contentHash": "sha256:c59e11a810eea8213100e89f090586de8f0bed8e71731bf64b2106c5b97a05e7",
+      "capabilities": [],
+      "status": "approved"
+    },
+    "warden-test-evil@1.0.0": {
+      "contentHash": "sha256:a5a01c55707be29ada9d34e0ff92daa70291189b12fb8f9b57372f0903e4b209",
+      "capabilities": [],
+      "status": "approved"
+    }
+  }
+}
