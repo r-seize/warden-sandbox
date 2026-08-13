@@ -6,6 +6,7 @@ import { Command } from 'commander';
 import {
   scanNodeModules,
   ScanCacheEntry,
+  loadGlobalCache,
 } from './analyzer/packageScanner';
 import { buildPolicyMap } from './policy/policyGenerator';
 import {
@@ -26,6 +27,7 @@ import {
   printAudit,
   printExplain,
   printDepGraph,
+  generateMarkdownReport,
 } from './report/cliReport';
 import chalk from 'chalk';
 import { readConfig, isIgnored } from './config';
@@ -37,7 +39,7 @@ const program = new Command();
 program
   .name('warden')
   .description('Runtime capability sandboxing for Node.js dependencies')
-  .version('0.1.0');
+  .version('0.1.1');
 
 // ─── scan ────────────────────────────────────────────────────────────────────
 
@@ -113,14 +115,26 @@ program
   .option('-d, --dir <path>', 'Project directory (default: cwd)', process.cwd())
   .option('--from <lockfile>', 'Path to the baseline lockfile (default: warden.lock.json in --dir)')
   .option('--to <lockfile>', 'Path to the new lockfile (default: scan node_modules now)')
+  .option('--since <date>', 'Compare against the lockfile from git history at the given date (e.g. "2026-08-01")')
   .option('-v, --verbose', 'Show content-only changes too')
-  .action(async (opts: { dir: string; from?: string; to?: string; verbose: boolean }) => {
+  .action(async (opts: { dir: string; from?: string; to?: string; since?: string; verbose: boolean }) => {
     const projectDir = path.resolve(opts.dir);
 
     let oldLock: LockfileData | null;
     let newLock: LockfileData;
 
-    if (opts.from) {
+    if (opts.since) {
+      const result = spawnSync('git', ['show', `HEAD@{${opts.since}}:warden.lock.json`], {
+        cwd: projectDir,
+        encoding: 'utf8',
+      });
+      if (result.status !== 0 || !result.stdout) {
+        console.error(chalk.red(`Error: Could not retrieve warden.lock.json at date "${opts.since}" from git history.`));
+        console.error(chalk.dim('  Make sure warden.lock.json is committed and the date is valid (e.g. "2026-08-01").'));
+        process.exit(1);
+      }
+      oldLock = JSON.parse(result.stdout) as LockfileData;
+    } else if (opts.from) {
       const raw = fs.readFileSync(path.resolve(opts.from), 'utf8');
       oldLock = JSON.parse(raw) as LockfileData;
     } else {
@@ -155,7 +169,8 @@ program
   .description('Verify node_modules matches committed lockfile (exits non-zero if diverged)')
   .option('-d, --dir <path>', 'Project directory (default: cwd)', process.cwd())
   .option('--json', 'Output machine-readable JSON (for CI pipelines)')
-  .action(async (opts: { dir: string; json: boolean }) => {
+  .option('--sarif', 'Output SARIF 2.1.0 JSON (for GitHub Advanced Security / code scanning)')
+  .action(async (opts: { dir: string; json: boolean; sarif: boolean }) => {
     const projectDir = path.resolve(opts.dir);
     const existing = readLockfile(projectDir);
 
@@ -214,6 +229,46 @@ program
     }
 
     const ok = violations.length === 0;
+
+    if (opts.sarif) {
+      const sarifResults = violations.map(v => {
+        let ruleId = 'WARDEN003';
+        if (v.includes('not in lockfile')) ruleId = 'WARDEN004';
+        else if (v.includes('content hash')) ruleId = 'WARDEN001';
+        else if (v.includes('new capabilities')) ruleId = 'WARDEN002';
+        const pkgKey = v.split(':')[0];
+        return {
+          ruleId,
+          level: 'error',
+          message: { text: v },
+          locations: [{ physicalLocation: { artifactLocation: { uri: `node_modules/${pkgKey.slice(0, pkgKey.lastIndexOf('@'))}` } } }],
+        };
+      });
+
+      const sarif = {
+        $schema: 'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json',
+        version: '2.1.0',
+        runs: [{
+          tool: {
+            driver: {
+              name: 'warden',
+              version: '0.1.0',
+              informationUri: 'https://github.com/r-seize/Warden',
+              rules: [
+                { id: 'WARDEN001', name: 'ContentHashChanged', shortDescription: { text: 'Package content changed since last approval' } },
+                { id: 'WARDEN002', name: 'NewCapabilities', shortDescription: { text: 'Package gained new capabilities' } },
+                { id: 'WARDEN003', name: 'PendingReview', shortDescription: { text: 'Package not yet approved' } },
+                { id: 'WARDEN004', name: 'NotInLockfile', shortDescription: { text: 'Package not registered in lockfile' } },
+              ],
+            },
+          },
+          results: sarifResults,
+        }],
+      };
+      console.log(JSON.stringify(sarif, null, 2));
+      process.exit(ok ? 0 : 1);
+    }
+
     if (opts.json) {
       console.log(JSON.stringify({ ok, violations }, null, 2));
     } else {
@@ -548,7 +603,8 @@ function isEsmScript(scriptPath: string): boolean {
 }
 
 function buildCacheFromLockfile(lock: LockfileData | null): Map<string, ScanCacheEntry> {
-  const cache = new Map<string, ScanCacheEntry>();
+  const globalCache = loadGlobalCache();
+  const cache = new Map<string, ScanCacheEntry>(globalCache);
   if (!lock) return cache;
   for (const [key, policy] of Object.entries(lock.packages)) {
     cache.set(key, {
@@ -566,6 +622,12 @@ function buildCacheFromLockfile(lock: LockfileData | null): Map<string, ScanCach
     });
   }
   return cache;
+}
+
+function detectPackageManager(projectDir: string): 'npm' | 'pnpm' | 'yarn' {
+  if (fs.existsSync(path.join(projectDir, 'pnpm-lock.yaml'))) return 'pnpm';
+  if (fs.existsSync(path.join(projectDir, 'yarn.lock'))) return 'yarn';
+  return 'npm';
 }
 
 // ─── status ──────────────────────────────────────────────────────────────────
@@ -593,7 +655,8 @@ program
   .description('Show capability breakdown across all packages, grouped by risk level')
   .option('-d, --dir <path>', 'Project directory (default: cwd)', process.cwd())
   .option('--json', 'Output raw JSON')
-  .action((opts: { dir: string; json: boolean }) => {
+  .option('--fix', 'Auto-approve low-risk pending packages (only env-access and/or filesystem-read)')
+  .action((opts: { dir: string; json: boolean; fix: boolean }) => {
     const projectDir = path.resolve(opts.dir);
     const lockfile = readLockfile(projectDir);
 
@@ -603,7 +666,6 @@ program
     }
 
     if (opts.json) {
-      // Build capability → packages map
       const byCapability: Record<string, string[]> = {};
       for (const [key, policy] of Object.entries(lockfile.packages)) {
         for (const cap of policy.capabilities) {
@@ -615,10 +677,31 @@ program
         total: Object.keys(lockfile.packages).length,
         byCapability,
       }, null, 2));
-      return;
+    } else {
+      printAudit(lockfile);
     }
 
-    printAudit(lockfile);
+    if (opts.fix) {
+      const LOW_RISK_ONLY = new Set(['env-access', 'filesystem-read']);
+      const toFix = Object.entries(lockfile.packages).filter(([, p]) => {
+        if (p.status !== 'pending-review') return false;
+        return p.capabilities.every(c => LOW_RISK_ONLY.has(c));
+      });
+
+      if (toFix.length === 0) {
+        console.log(chalk.dim('\n  --fix: No low-risk pending packages to auto-approve.'));
+        return;
+      }
+
+      for (const [, entry] of toFix) {
+        entry.status = 'approved';
+        delete entry.note;
+      }
+
+      lockfile.generatedAt = new Date().toISOString();
+      writeLockfile(projectDir, lockfile);
+      console.log(chalk.green(`\n  --fix: Auto-approved ${toFix.length} low-risk package(s).`));
+    }
   });
 
 // ─── install ─────────────────────────────────────────────────────────────────
@@ -634,20 +717,20 @@ program
     const config = readConfig(projectDir);
     const approveAll = opts.approveAll || (config.autoApprove ?? false);
 
-    // Forward all unknown flags and package args directly to npm install
+    const pm = detectPackageManager(projectDir);
     const unknownArgs = cmd.args.filter((a: string) => !pkgArgs.includes(a));
-    const npmArgs = ['install', ...pkgArgs, ...unknownArgs];
+    const pmArgs = ['install', ...pkgArgs, ...unknownArgs];
 
-    console.log(chalk.bold(`\nWarden install — running npm ${npmArgs.join(' ')}\n`));
+    console.log(chalk.bold(`\nWarden install — running ${pm} ${pmArgs.join(' ')}\n`));
 
-    const result = spawnSync('npm', npmArgs, {
+    const result = spawnSync(pm, pmArgs, {
       cwd: projectDir,
       stdio: 'inherit',
       shell: false,
     });
 
     if (result.status !== 0) {
-      console.error(chalk.red('\nError: npm install failed.'));
+      console.error(chalk.red(`\nError: ${pm} install failed.`));
       process.exit(result.status ?? 1);
     }
 
@@ -712,19 +795,20 @@ program
     const config = readConfig(projectDir);
     const approveAll = opts.approveAll || (config.autoApprove ?? false);
 
+    const pm = detectPackageManager(projectDir);
     const unknownArgs = cmd.args.filter((a: string) => !pkgArgs.includes(a));
-    const npmArgs = ['update', ...pkgArgs, ...unknownArgs];
+    const pmArgs = ['update', ...pkgArgs, ...unknownArgs];
 
-    console.log(chalk.bold(`\nWarden update — running npm ${npmArgs.join(' ')}\n`));
+    console.log(chalk.bold(`\nWarden update — running ${pm} ${pmArgs.join(' ')}\n`));
 
-    const result = spawnSync('npm', npmArgs, {
+    const result = spawnSync(pm, pmArgs, {
       cwd: projectDir,
       stdio: 'inherit',
       shell: false,
     });
 
     if (result.status !== 0) {
-      console.error(chalk.red('\nError: npm update failed.'));
+      console.error(chalk.red(`\nError: ${pm} update failed.`));
       process.exit(result.status ?? 1);
     }
 
@@ -1003,6 +1087,83 @@ program
     console.log('');
 
     process.exit(issues.length > 0 ? 1 : 0);
+  });
+
+// ─── report ──────────────────────────────────────────────────────────────────
+
+program
+  .command('report')
+  .description('Generate a Markdown security report for the current lockfile')
+  .option('-d, --dir <path>', 'Project directory (default: cwd)', process.cwd())
+  .option('--output <file>', 'Output file path (default: warden-report.md)', 'warden-report.md')
+  .option('--format <fmt>', 'Output format (default: md)', 'md')
+  .action((opts: { dir: string; output: string; format: string }) => {
+    const projectDir = path.resolve(opts.dir);
+    const lockfile = readLockfile(projectDir);
+
+    if (!lockfile) {
+      console.error(chalk.red('Error: No warden.lock.json found. Run `warden scan` first.'));
+      process.exit(1);
+    }
+
+    const md = generateMarkdownReport(lockfile);
+    const outPath = path.resolve(opts.output);
+    fs.writeFileSync(outPath, md, 'utf8');
+    console.log(chalk.green(`\n  Warden report written to ${outPath}`));
+  });
+
+// ─── watch ───────────────────────────────────────────────────────────────────
+
+program
+  .command('watch')
+  .description('Watch node_modules for changes and auto-rescan on dependency updates')
+  .option('-d, --dir <path>', 'Project directory (default: cwd)', process.cwd())
+  .action(async (opts: { dir: string }) => {
+    const projectDir = path.resolve(opts.dir);
+    const nodeModulesDir = path.join(projectDir, 'node_modules');
+
+    if (!fs.existsSync(nodeModulesDir)) {
+      console.error(chalk.red(`Error: No node_modules at ${nodeModulesDir}`));
+      process.exit(1);
+    }
+
+    let currentLock = readLockfile(projectDir);
+
+    if (!currentLock) {
+      console.error(chalk.red('Error: No warden.lock.json found. Run `warden scan` first.'));
+      process.exit(1);
+    }
+
+    console.log(chalk.bold('\nWarden watch — monitoring node_modules for changes...'));
+    console.log(chalk.dim('  Press Ctrl+C to stop.\n'));
+
+    let debounce: ReturnType<typeof setTimeout> | null = null;
+
+    const rescan = async () => {
+      console.log(chalk.dim('\n[warden watch] Change detected — rescanning...'));
+      try {
+        const cache = buildCacheFromLockfile(currentLock);
+        const results = await scanNodeModules(nodeModulesDir, cache);
+        const newPolicies = buildPolicyMap(results);
+        const newLock = mergeLockfile(null, newPolicies);
+
+        const summary = diffLockfiles(currentLock, newLock);
+        printDiffSummary(summary, false);
+
+        if (summary.packagesWithNewCapabilities > 0) {
+          console.log(chalk.red.bold('[warden watch] WARNING: New capabilities detected. Run `warden approve` after reviewing.'));
+        }
+
+        currentLock = readLockfile(projectDir) ?? currentLock;
+      } catch (err) {
+        console.error(chalk.red(`[warden watch] Rescan error: ${(err as Error).message}`));
+      }
+    };
+
+    fs.watch(nodeModulesDir, { recursive: true }, () => {
+      if (debounce) clearTimeout(debounce);
+      debounce = setTimeout(() => { void rescan(); }, 1000);
+    });
   });
 
 // ─── config init ─────────────────────────────────────────────────────────────

@@ -163,12 +163,46 @@ export function scanPackage(
   };
 }
 
+export function getGlobalCacheDir(): string {
+  const home = process.env.HOME ?? process.env.USERPROFILE ?? '/tmp';
+  return path.join(home, '.warden', 'cache');
+}
+
+export function loadGlobalCache(): Map<string, ScanCacheEntry> {
+  const cacheDir = getGlobalCacheDir();
+  const cache = new Map<string, ScanCacheEntry>();
+  try {
+    if (!fs.existsSync(cacheDir)) return cache;
+    const files = fs.readdirSync(cacheDir).filter(f => f.endsWith('.json'));
+    for (const file of files) {
+      try {
+        const entry = JSON.parse(fs.readFileSync(path.join(cacheDir, file), 'utf8')) as ScanCacheEntry;
+        cache.set(entry.result.name + '@' + entry.result.version, entry);
+      } catch { /* skip corrupt entries */ }
+    }
+  } catch { /* ignore */ }
+  return cache;
+}
+
+export function saveToGlobalCache(result: PackageScanResult): void {
+  const cacheDir = getGlobalCacheDir();
+  try {
+    fs.mkdirSync(cacheDir, { recursive: true });
+    const key = result.name.replace(/\//g, '__') + '@' + result.version;
+    const entry: ScanCacheEntry = { contentHash: result.contentHash, result };
+    fs.writeFileSync(path.join(cacheDir, `${key}.json`), JSON.stringify(entry), 'utf8');
+  } catch { /* ignore cache write errors */ }
+}
+
 // Scan all packages in a node_modules directory with optional progress callback.
 export async function scanNodeModules(
   nodeModulesDir: string,
   cache: Map<string, ScanCacheEntry>,
   onProgress?: (done: number, total: number, pkgName: string) => void,
+  useGlobalCache = true,
 ): Promise<PackageScanResult[]> {
+  const globalCache = useGlobalCache ? loadGlobalCache() : new Map<string, ScanCacheEntry>();
+
   const packages = discoverPackages(nodeModulesDir);
   const results: PackageScanResult[] = [];
   let done = 0;
@@ -178,12 +212,18 @@ export async function scanNodeModules(
     const name = pkgJson.name ?? path.basename(pkgDir);
     const version = pkgJson.version ?? 'unknown';
     const cacheKey = `${name}@${version}`;
-    const cachedEntry = cache.get(cacheKey);
+    const cachedEntry = cache.get(cacheKey) ?? globalCache.get(cacheKey);
 
     onProgress?.(done, packages.length, name);
 
+    const isCacheHit = cachedEntry !== undefined;
     const result = scanPackage(pkgDir, cachedEntry);
     results.push(result);
+
+    if (!isCacheHit && useGlobalCache) {
+      saveToGlobalCache(result);
+    }
+
     done++;
   }
 

@@ -1,4 +1,10 @@
-# Warden
+# warden-sandbox
+
+[![npm version](https://img.shields.io/npm/v/warden-sandbox)](https://www.npmjs.com/package/warden-sandbox)
+[![npm downloads](https://img.shields.io/npm/dt/warden-sandbox)](https://www.npmjs.com/package/warden-sandbox)
+[![CI](https://github.com/r-seize/Warden/actions/workflows/ci.yml/badge.svg)](https://github.com/r-seize/Warden/actions/workflows/ci.yml)
+[![license](https://img.shields.io/npm/l/warden-sandbox)](LICENSE)
+[![node](https://img.shields.io/node/v/warden-sandbox)](https://nodejs.org)
 
 Runtime capability sandboxing for Node.js dependencies.
 
@@ -17,10 +23,12 @@ Warden addresses a class of supply-chain attacks where malicious code executes *
   - [warden run](#warden-run)
   - [warden status](#warden-status)
   - [warden audit](#warden-audit)
+  - [warden report](#warden-report)
   - [warden explain](#warden-explain)
   - [warden graph](#warden-graph)
   - [warden install](#warden-install)
   - [warden update](#warden-update)
+  - [warden watch](#warden-watch)
   - [warden integrity](#warden-integrity)
   - [warden config init](#warden-config-init)
 - [Configuration file](#configuration-file-wardenrcjson)
@@ -28,6 +36,7 @@ Warden addresses a class of supply-chain attacks where malicious code executes *
 - [Capabilities](#capabilities)
 - [Package statuses](#package-statuses)
 - [Profiles](#profiles)
+- [Performance](#performance)
 - [Security limitations](#security-limitations)
 - [License](#license)
 - [Contributing](#contributing)
@@ -114,7 +123,7 @@ Packages with detected capabilities:
 Compares the current state of `node_modules` against the committed lockfile and reports any capability changes. Run this after `npm update` to understand the security impact before approving anything.
 
 ```
-warden diff [--dir <path>] [--from <lockfile>] [--to <lockfile>] [-v]
+warden diff [--dir <path>] [--from <lockfile>] [--to <lockfile>] [--since <date>] [-v]
 ```
 
 | Flag | Description |
@@ -122,7 +131,12 @@ warden diff [--dir <path>] [--from <lockfile>] [--to <lockfile>] [-v]
 | `--dir <path>` | Project directory (default: cwd) |
 | `--from <lockfile>` | Baseline lockfile to compare against (default: `warden.lock.json`) |
 | `--to <lockfile>` | Lockfile to compare to (default: scan current `node_modules` now) |
+| `--since <date>` | Compare against the lockfile from git history at the given date (e.g. `"2026-08-01"`). Requires `warden.lock.json` to be committed. |
 | `-v, --verbose` | Also show packages whose code changed but capabilities stayed the same |
+
+```bash
+warden diff --since 2026-08-01
+```
 
 **Example output:**
 
@@ -143,17 +157,24 @@ Warden Diff
 Compares the current state of `node_modules` against the committed lockfile. Exits `1` if any package has a changed content hash, new capabilities, or a `pending-review` status. Packages listed under `ignore` in `.wardenrc.json` are skipped.
 
 ```
-warden verify [--dir <path>] [--json]
+warden verify [--dir <path>] [--json] [--sarif]
 ```
 
 | Flag | Description |
 |---|---|
 | `--dir <path>` | Project directory (default: cwd) |
 | `--json` | Output `{ "ok": boolean, "violations": string[] }` |
+| `--sarif` | Output SARIF 2.1.0 JSON for GitHub Advanced Security / code scanning integration |
 
 ```yaml
 # GitHub Actions
 - run: warden verify
+
+# With SARIF upload for GitHub code scanning
+- run: warden verify --sarif > warden.sarif || true
+- uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: warden.sarif
 ```
 
 ### `warden approve`
@@ -264,13 +285,18 @@ Warden Status
 Shows which packages use each capability, grouped by risk level (HIGH / MEDIUM / LOW).
 
 ```
-warden audit [--dir <path>] [--json]
+warden audit [--dir <path>] [--json] [--fix]
 ```
 
 | Flag | Description |
 |---|---|
 | `--dir <path>` | Project directory (default: cwd) |
 | `--json` | Output `{ "total": number, "byCapability": { "[cap]": ["pkg@version"] } }` |
+| `--fix` | Auto-approve all `pending-review` packages whose only capabilities are `env-access` and/or `filesystem-read` (low-risk only). Writes the lockfile. |
+
+```bash
+warden audit --fix
+```
 
 ```
 Warden Capability Audit
@@ -287,6 +313,31 @@ Warden Capability Audit
   LOW RISK
     [FS-READ]  filesystem-read    12 pkgs  resolve@1.22.8 +11 more
 ```
+
+### `warden report`
+
+Generates a Markdown security report summarising the current lockfile state. Includes a risk-scored table of all packages, packages pending review, and a capability breakdown.
+
+```
+warden report [--dir <path>] [--output <file>] [--format md]
+```
+
+| Flag | Description |
+|---|---|
+| `--dir <path>` | Project directory (default: cwd) |
+| `--output <file>` | Output file path (default: `warden-report.md`) |
+| `--format <fmt>` | Output format. Currently only `md` is supported. |
+
+```bash
+warden report
+warden report --output security/warden-report.md
+```
+
+The report includes:
+- A summary table (total, approved, pending, unsandboxed, high-risk count)
+- Top 10 highest-risk packages by score with their capabilities
+- All packages pending review
+- Capability breakdown table
 
 ### `warden explain`
 
@@ -354,15 +405,15 @@ Packages with high-risk capabilities (`[NETWORK]`, `[SPAWN]`, `[EVAL]`, `[NATIVE
 
 ### `warden install`
 
-Wraps `npm install`, then automatically rescans `node_modules` and reports packages needing review. All unknown flags are forwarded to npm.
+Wraps your package manager's `install` command, then automatically rescans `node_modules` and reports packages needing review. All unknown flags are forwarded to the package manager. Warden auto-detects which package manager to use: if `pnpm-lock.yaml` is present it uses `pnpm`, if `yarn.lock` is present it uses `yarn`, otherwise it uses `npm`.
 
 ```
-warden install [packages...] [--approve-all] [--dir <path>] [...npm flags]
+warden install [packages...] [--approve-all] [--dir <path>] [...pm flags]
 ```
 
 | Flag | Description |
 |---|---|
-| `packages...` | Packages to install — forwarded to npm |
+| `packages...` | Packages to install — forwarded to the package manager |
 | `--approve-all` | Auto-approve all new packages (or set `autoApprove: true` in `.wardenrc.json`) |
 | `--dir <path>` | Project directory (default: cwd) |
 
@@ -375,15 +426,15 @@ warden install some-package --legacy-peer-deps
 
 ### `warden update`
 
-Wraps `npm update`, then rescans and reports packages whose capabilities changed.
+Wraps your package manager's `update` command, then rescans and reports packages whose capabilities changed. Uses the same auto-detection as `warden install` (pnpm, yarn, or npm).
 
 ```
-warden update [packages...] [--approve-all] [--dir <path>] [...npm flags]
+warden update [packages...] [--approve-all] [--dir <path>] [...pm flags]
 ```
 
 | Flag | Description |
 |---|---|
-| `packages...` | Packages to update — forwarded to npm (updates all if omitted) |
+| `packages...` | Packages to update — forwarded to the package manager (updates all if omitted) |
 | `--approve-all` | Auto-approve all changed packages after update |
 | `--dir <path>` | Project directory (default: cwd) |
 
@@ -394,6 +445,25 @@ warden update --approve-all
 ```
 
 After update, Warden lists every package whose capabilities changed. Without `--approve-all`, run `warden diff` to review and then `warden approve` to accept.
+
+### `warden watch`
+
+Watches `node_modules` for filesystem changes and automatically rescans when dependencies change. Reports a capability diff after each change and warns if new capabilities are detected.
+
+```
+warden watch [--dir <path>]
+```
+
+| Flag | Description |
+|---|---|
+| `--dir <path>` | Project directory (default: cwd) |
+
+```bash
+warden watch
+warden watch --dir /path/to/project
+```
+
+Changes are debounced by 1 second to avoid thrashing during multi-file installs. Press Ctrl+C to stop. Requires an existing `warden.lock.json` (run `warden scan` first).
 
 ### `warden integrity`
 
@@ -550,6 +620,16 @@ The `--profile` flag (or `profile` in `.wardenrc.json`) adjusts what is enforced
 ```bash
 warden run --enforce --profile strict script.js
 warden run --enforce --profile lenient script.js
+```
+
+## Performance
+
+Warden maintains a shared scan cache at `~/.warden/cache/`. After a package has been scanned once on your machine, subsequent scans of the same version (by content hash) are instant regardless of which project you are scanning. The local project lockfile cache is also used as a first-level cache, with the global cache as a fallback.
+
+To disable the global cache for a single run, you can clear the directory:
+
+```bash
+rm -rf ~/.warden/cache/
 ```
 
 ## Security Limitations

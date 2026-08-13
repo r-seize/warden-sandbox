@@ -5,6 +5,7 @@ import { DiffSummary, PackageDiff } from '../policy/policyDiff';
 import { LockfileData, PackageStatus } from '../policy/lockfile';
 import { PackageExplainResult } from '../analyzer/explainer';
 import { DepGraph } from '../analyzer/depGraph';
+import { riskScore, riskLabel } from '../analyzer/riskScore';
 
 // ─── Capability formatting ───────────────────────────────────────────────────
 
@@ -354,6 +355,78 @@ export function printExplain(result: PackageExplainResult): void {
     }
     console.log('');
   }
+}
+
+// ─── Markdown report ─────────────────────────────────────────────────────────
+
+export function generateMarkdownReport(lock: LockfileData): string {
+  const entries = Object.entries(lock.packages);
+  const approved = entries.filter(([, p]) => p.status === 'approved');
+  const pending = entries.filter(([, p]) => p.status === 'pending-review');
+  const unsandboxed = entries.filter(([, p]) => p.status === 'unsandboxed');
+
+  const scored = entries.map(([key, p]) => ({ key, policy: p, score: riskScore(p) }));
+  const highRisk = scored.filter(e => e.score >= 40);
+  const top10 = [...scored].sort((a, b) => b.score - a.score).slice(0, 10);
+
+  const capCount = new Map<string, number>();
+  for (const [, p] of entries) {
+    for (const cap of p.capabilities) {
+      capCount.set(cap, (capCount.get(cap) ?? 0) + 1);
+    }
+  }
+
+  const lines: string[] = [];
+
+  lines.push('# Warden Security Report');
+  lines.push('');
+  lines.push(`Generated: ${new Date().toISOString()}`);
+  lines.push('');
+  lines.push('## Summary');
+  lines.push('');
+  lines.push('| Metric | Count |');
+  lines.push('|---|---|');
+  lines.push(`| Total packages | ${entries.length} |`);
+  lines.push(`| Approved | ${approved.length} |`);
+  lines.push(`| Pending review | ${pending.length} |`);
+  lines.push(`| Unsandboxed (native) | ${unsandboxed.length} |`);
+  lines.push(`| High-risk (score >= 40) | ${highRisk.length} |`);
+  lines.push('');
+
+  lines.push('## Top 10 Highest Risk Packages');
+  lines.push('');
+  lines.push('| Package | Score | Risk | Capabilities |');
+  lines.push('|---|---|---|---|');
+  for (const e of top10) {
+    const label = riskLabel(e.score);
+    const caps = e.policy.capabilities.join(', ') || 'none';
+    lines.push(`| ${e.key} | ${e.score} | ${label} | ${caps} |`);
+  }
+  lines.push('');
+
+  if (pending.length > 0) {
+    lines.push('## Packages Pending Review');
+    lines.push('');
+    lines.push('| Package | Capabilities |');
+    lines.push('|---|---|');
+    for (const [key, p] of pending) {
+      const caps = p.capabilities.join(', ') || 'none';
+      lines.push(`| ${key} | ${caps} |`);
+    }
+    lines.push('');
+  }
+
+  lines.push('## Capability Breakdown');
+  lines.push('');
+  lines.push('| Capability | Package Count |');
+  lines.push('|---|---|');
+  const sortedCaps = [...capCount.entries()].sort((a, b) => b[1] - a[1]);
+  for (const [cap, count] of sortedCaps) {
+    lines.push(`| ${cap} | ${count} |`);
+  }
+  lines.push('');
+
+  return lines.join('\n');
 }
 
 // ─── Dependency graph ─────────────────────────────────────────────────────────
