@@ -32,15 +32,15 @@ export function diffLockfiles(
   oldLock: LockfileData | null,
   newLock: LockfileData,
 ): DiffSummary {
-  const oldPkgs = oldLock?.packages ?? {};
-  const newPkgs = newLock.packages;
+  const oldPkgs    = oldLock?.packages ?? {};
+  const newPkgs    = newLock.packages;
 
-  const allKeys = new Set([...Object.keys(oldPkgs), ...Object.keys(newPkgs)]);
-  const diffs: PackageDiff[] = [];
+  const allKeys                 = new Set([...Object.keys(oldPkgs), ...Object.keys(newPkgs)]);
+  const diffs: PackageDiff[]    = [];
 
   for (const key of allKeys) {
-    const oldPolicy = oldPkgs[key] as PackagePolicy | undefined;
-    const newPolicy = newPkgs[key] as PackagePolicy | undefined;
+    const oldPolicy    = oldPkgs[key] as PackagePolicy | undefined;
+    const newPolicy    = newPkgs[key] as PackagePolicy | undefined;
 
     if (!oldPolicy && newPolicy) {
       diffs.push({
@@ -69,8 +69,8 @@ export function diffLockfiles(
     // Both exist
     if (!oldPolicy || !newPolicy) continue;
 
-    const oldCaps = new Set<Capability>(oldPolicy.capabilities as Capability[]);
-    const newCaps = new Set<Capability>(newPolicy.capabilities as Capability[]);
+    const oldCaps    = new Set<Capability>(oldPolicy.capabilities as Capability[]);
+    const newCaps    = new Set<Capability>(newPolicy.capabilities as Capability[]);
 
     const addedCapabilities = newPolicy.capabilities.filter(
       (c): c is Capability => !oldCaps.has(c as Capability),

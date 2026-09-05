@@ -95,9 +95,9 @@ function buildControlledRequire(
 
     if (enforce) {
       // Determine which package the required module belongs to
-      const targetPkgName = getPackageNameFromPath(resolvedFilename);
-      const targetPolicy = targetPkgName ? getPolicy(lockfile, targetPkgName) : null;
-      const targetCaps: Set<Capability> = targetPolicy
+      const targetPkgName                  = getPackageNameFromPath(resolvedFilename);
+      const targetPolicy                   = targetPkgName ? getPolicy(lockfile, targetPkgName) : null;
+      const targetCaps: Set<Capability>    = targetPolicy
         ? effectiveCaps(targetPolicy, profile, enforce)
         : new Set<Capability>();
 
@@ -244,8 +244,8 @@ export function installModuleLoaderHook(
       return orig(request, parent, isMain);
     }
 
-    const caps = effectiveCaps(policy, profile, enforce);
-    const isBuiltin = NodeModulePrivate.isBuiltin(request);
+    const caps         = effectiveCaps(policy, profile, enforce);
+    const isBuiltin    = NodeModulePrivate.isBuiltin(request);
 
     if (isBuiltin) {
       return buildTamedBuiltin(request, caps, callerPkgName, onViolation);
@@ -274,9 +274,9 @@ export function installModuleLoaderHook(
         return orig(request, parent, isMain);
       }
 
-      const targetPkgName = getPackageNameFromPath(resolvedFilename) ?? resolvedFilename;
-      const targetPolicy = getPolicy(lockfile, targetPkgName);
-      const targetCaps = targetPolicy
+      const targetPkgName    = getPackageNameFromPath(resolvedFilename) ?? resolvedFilename;
+      const targetPolicy     = getPolicy(lockfile, targetPkgName);
+      const targetCaps       = targetPolicy
         ? effectiveCaps(targetPolicy, profile, enforce)
         : new Set<Capability>();
 
@@ -321,8 +321,8 @@ export function installModuleLoaderHook(
   // Return an uninstall function
   return function uninstall(): void {
     if (originalLoad !== null) {
-      NodeModulePrivate._load = originalLoad;
-      originalLoad = null;
+      NodeModulePrivate._load    = originalLoad;
+      originalLoad               = null;
     }
   };
 }

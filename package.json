@@ -1,6 +1,6 @@
 {
   "name": "warden-sandbox",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Runtime capability sandboxing for Node.js dependencies",
   "type": "commonjs",
   "bin": {
@@ -28,11 +28,11 @@
   "license": "BSD-2-Clause",
   "repository": {
     "type": "git",
-    "url": "https://github.com/r-seize/Warden.git"
+    "url": "https://github.com/r-seize/warden-sandbox.git"
   },
-  "homepage": "https://github.com/r-seize/Warden#readme",
+  "homepage": "https://github.com/r-seize/warden-sandbox#readme",
   "bugs": {
-    "url": "https://github.com/r-seize/Warden/issues"
+    "url": "https://github.com/r-seize/warden-sandbox/issues"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -47,7 +47,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.3",
+    "typescript": "^7.0.2",
     "vitest": "^3.2.4"
   }
 }

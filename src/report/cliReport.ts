@@ -30,8 +30,8 @@ const CAPABILITY_LABELS: Record<Capability, string> = {
 };
 
 export function formatCapability(cap: Capability): string {
-  const color = CAPABILITY_COLORS[cap] ?? chalk.white;
-  const label = CAPABILITY_LABELS[cap] ?? `[${cap.toUpperCase()}]`;
+  const color    = CAPABILITY_COLORS[cap] ?? chalk.white;
+  const label    = CAPABILITY_LABELS[cap] ?? `[${cap.toUpperCase()}]`;
   return color(label);
 }
 
@@ -49,9 +49,9 @@ export function formatStatus(status: PackageStatus): string {
 // ─── Scan summary ────────────────────────────────────────────────────────────
 
 export function printScanSummary(results: PackageScanResult[]): void {
-  const withCaps = results.filter(r => r.capabilities.length > 0);
-  const unsandboxed = results.filter(r => r.hasNativeBindings);
-  const clean = results.filter(r => r.capabilities.length === 0 && !r.hasNativeBindings);
+  const withCaps       = results.filter(r => r.capabilities.length > 0);
+  const unsandboxed    = results.filter(r => r.hasNativeBindings);
+  const clean          = results.filter(r => r.capabilities.length === 0 && !r.hasNativeBindings);
 
   console.log('');
   console.log(chalk.bold.underline('Warden Scan Summary'));
@@ -72,13 +72,13 @@ export function printScanSummary(results: PackageScanResult[]): void {
     );
 
     for (const result of withCaps) {
-      const nameVer = `${result.name}@${result.version}`;
-      const padded = nameVer.length > maxNameLen
+      const nameVer    = `${result.name}@${result.version}`;
+      const padded     = nameVer.length > maxNameLen
         ? nameVer.slice(0, maxNameLen - 1) + '…'
         : nameVer.padEnd(maxNameLen);
 
-      const caps = result.capabilities.map(formatCapability).join('  ');
-      const marker = result.hasNativeBindings
+      const caps      = result.capabilities.map(formatCapability).join('  ');
+      const marker    = result.hasNativeBindings
         ? chalk.bgRed.white(' NATIVE ') + ' '
         : result.unanalyzableFiles.length > 0
         ? chalk.magenta(' ~PARTIAL ') + ' '
@@ -172,10 +172,10 @@ function printPackageDiff(d: PackageDiff): void {
 // ─── Lockfile overview ───────────────────────────────────────────────────────
 
 export function printLockfileOverview(lock: LockfileData): void {
-  const entries = Object.entries(lock.packages);
-  const pending = entries.filter(([, p]) => p.status === 'pending-review');
-  const unsandboxed = entries.filter(([, p]) => p.status === 'unsandboxed');
-  const approved = entries.filter(([, p]) => p.status === 'approved');
+  const entries        = Object.entries(lock.packages);
+  const pending        = entries.filter(([, p]) => p.status === 'pending-review');
+  const unsandboxed    = entries.filter(([, p]) => p.status === 'unsandboxed');
+  const approved       = entries.filter(([, p]) => p.status === 'approved');
 
   console.log('');
   console.log(chalk.bold.underline('Warden Lockfile Status'));
@@ -255,9 +255,9 @@ export function printStatus(lock: LockfileData): void {
 
 // ─── Audit — capability breakdown ────────────────────────────────────────────
 
-const HIGH_RISK: Capability[] = ['network', 'process-spawn', 'dynamic-code', 'native-binding'];
-const MEDIUM_RISK: Capability[] = ['filesystem-write', 'env-access'];
-const LOW_RISK: Capability[] = ['filesystem-read'];
+const HIGH_RISK: Capability[]      = ['network', 'process-spawn', 'dynamic-code', 'native-binding'];
+const MEDIUM_RISK: Capability[]    = ['filesystem-write', 'env-access'];
+const LOW_RISK: Capability[]       = ['filesystem-read'];
 
 export function printAudit(lock: LockfileData): void {
   const entries = Object.entries(lock.packages);
@@ -271,9 +271,9 @@ export function printAudit(lock: LockfileData): void {
     }
   }
 
-  const total = entries.length;
-  const withCaps = entries.filter(([, p]) => p.capabilities.length > 0 || p.status === 'unsandboxed').length;
-  const clean = total - withCaps;
+  const total       = entries.length;
+  const withCaps    = entries.filter(([, p]) => p.capabilities.length > 0 || p.status === 'unsandboxed').length;
+  const clean       = total - withCaps;
 
   console.log('');
   console.log(chalk.bold.underline('Warden Capability Audit'));
@@ -286,10 +286,10 @@ export function printAudit(lock: LockfileData): void {
 
     console.log(color(chalk.bold(`  ${label}`)));
     for (const cap of relevant) {
-      const pkgs = byCapability.get(cap)!;
-      const icon = CAPABILITY_LABELS[cap] ?? `[${cap.toUpperCase()}]`;
-      const sample = pkgs.slice(0, 3).map(p => chalk.dim(p)).join(', ');
-      const more = pkgs.length > 3 ? chalk.dim(` +${pkgs.length - 3} more`) : '';
+      const pkgs      = byCapability.get(cap)!;
+      const icon      = CAPABILITY_LABELS[cap] ?? `[${cap.toUpperCase()}]`;
+      const sample    = pkgs.slice(0, 3).map(p => chalk.dim(p)).join(', ');
+      const more      = pkgs.length > 3 ? chalk.dim(` +${pkgs.length - 3} more`) : '';
       console.log(`    ${color(`${icon} ${cap.padEnd(18)}`)}  ${pkgs.length} pkg${pkgs.length !== 1 ? 's' : ''}  ${sample}${more}`);
     }
     console.log('');
@@ -307,10 +307,37 @@ export function printAudit(lock: LockfileData): void {
 
 // ─── Progress bar ────────────────────────────────────────────────────────────
 
+/**
+ * Create a progress printer that shows a bar, percentage, and ETA.
+ * Call the returned function in the onProgress callback of scanNodeModules.
+ */
+export function createProgressPrinter(): (done: number, total: number, current: string) => void {
+  const startTime = Date.now();
+  return (done: number, total: number, current: string) => {
+    const pct          = total === 0 ? 100 : Math.floor((done / total) * 100);
+    const bar          = '█'.repeat(Math.floor(pct / 4)) + '░'.repeat(25 - Math.floor(pct / 4));
+    const truncated    = current.length > 30 ? current.slice(0, 29) + '…' : current.padEnd(30);
+
+    let etaStr = '';
+    if (done > 0 && done < total) {
+      const elapsed    = Date.now() - startTime;
+      const eta        = Math.ceil((elapsed / done) * (total - done) / 1000);
+      etaStr           = chalk.dim(` ~${eta}s`);
+    }
+
+    process.stdout.write(`\r  ${bar} ${String(pct).padStart(3)}%  ${chalk.dim(truncated)}${etaStr}`);
+    if (done === total) process.stdout.write('\n');
+  };
+}
+
+/**
+ * Simple progress printer without ETA (kept for backwards compatibility).
+ * Prefer createProgressPrinter() for new call sites.
+ */
 export function printProgress(done: number, total: number, current: string): void {
-  const pct = total === 0 ? 100 : Math.floor((done / total) * 100);
-  const bar = '█'.repeat(Math.floor(pct / 4)) + '░'.repeat(25 - Math.floor(pct / 4));
-  const truncated = current.length > 35 ? current.slice(0, 34) + '…' : current.padEnd(35);
+  const pct          = total === 0 ? 100 : Math.floor((done / total) * 100);
+  const bar          = '█'.repeat(Math.floor(pct / 4)) + '░'.repeat(25 - Math.floor(pct / 4));
+  const truncated    = current.length > 35 ? current.slice(0, 34) + '…' : current.padEnd(35);
   process.stdout.write(`\r  ${bar} ${String(pct).padStart(3)}%  ${chalk.dim(truncated)}`);
   if (done === total) process.stdout.write('\n');
 }
@@ -360,14 +387,14 @@ export function printExplain(result: PackageExplainResult): void {
 // ─── Markdown report ─────────────────────────────────────────────────────────
 
 export function generateMarkdownReport(lock: LockfileData): string {
-  const entries = Object.entries(lock.packages);
-  const approved = entries.filter(([, p]) => p.status === 'approved');
-  const pending = entries.filter(([, p]) => p.status === 'pending-review');
-  const unsandboxed = entries.filter(([, p]) => p.status === 'unsandboxed');
+  const entries        = Object.entries(lock.packages);
+  const approved       = entries.filter(([, p]) => p.status === 'approved');
+  const pending        = entries.filter(([, p]) => p.status === 'pending-review');
+  const unsandboxed    = entries.filter(([, p]) => p.status === 'unsandboxed');
 
-  const scored = entries.map(([key, p]) => ({ key, policy: p, score: riskScore(p) }));
-  const highRisk = scored.filter(e => e.score >= 40);
-  const top10 = [...scored].sort((a, b) => b.score - a.score).slice(0, 10);
+  const scored      = entries.map(([key, p]) => ({ key, policy: p, score: riskScore(p) }));
+  const highRisk    = scored.filter(e => e.score >= 40);
+  const top10       = [...scored].sort((a, b) => b.score - a.score).slice(0, 10);
 
   const capCount = new Map<string, number>();
   for (const [, p] of entries) {
@@ -398,8 +425,8 @@ export function generateMarkdownReport(lock: LockfileData): string {
   lines.push('| Package | Score | Risk | Capabilities |');
   lines.push('|---|---|---|---|');
   for (const e of top10) {
-    const label = riskLabel(e.score);
-    const caps = e.policy.capabilities.join(', ') || 'none';
+    const label    = riskLabel(e.score);
+    const caps     = e.policy.capabilities.join(', ') || 'none';
     lines.push(`| ${e.key} | ${e.score} | ${label} | ${caps} |`);
   }
   lines.push('');
@@ -429,6 +456,95 @@ export function generateMarkdownReport(lock: LockfileData): string {
   return lines.join('\n');
 }
 
+// ─── JUnit XML report ────────────────────────────────────────────────────────
+
+/**
+ * Generate a JUnit XML report from warden verify violations.
+ * Compatible with Jenkins, GitLab CI, and GitHub Actions test reporters.
+ *
+ * @param violations  List of violation strings from the verify command.
+ * @param elapsedSec  Optional scan duration in seconds (included in the XML).
+ */
+export function generateJUnitReport(violations: string[], elapsedSec = 0): string {
+  const failures    = violations.length;
+  const tests       = Math.max(1, failures); // at least one test case so the suite shows up
+
+  const escapeXml = (s: string) =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+  const testCases = violations.length === 0
+    ? '    <testcase name="warden-verify" classname="warden" time="0"/>\n'
+    : violations.map(v => {
+        const pkgKey                                       = v.split(':')[0] ?? 'unknown';
+        let ruleId                                         = 'WARDEN003';
+        if (v.includes('not in lockfile')) ruleId          = 'WARDEN004';
+        else if (v.includes('content hash')) ruleId        = 'WARDEN001';
+        else if (v.includes('new capabilities')) ruleId    = 'WARDEN002';
+        return (
+          `    <testcase name     = "${escapeXml(pkgKey)}" classname="warden" time="0">\n` +
+          `      <failure type    = "${ruleId}" message="${escapeXml(v)}">${escapeXml(v)}</failure>\n` +
+          `    </testcase>\n`
+        );
+      }).join('');
+
+  return (
+    `<?xml version        = "1.0" encoding="UTF-8"?>\n` +
+    `<testsuites name     = "warden" tests="${tests}" failures="${failures}" errors="0" time="${elapsedSec.toFixed(2)}">\n` +
+    `  <testsuite name    = "warden-verify" tests="${tests}" failures="${failures}" errors="0" time="${elapsedSec.toFixed(2)}">\n` +
+    testCases +
+    `  </testsuite>\n` +
+    `</testsuites>\n`
+  );
+}
+
+// ─── SARIF report ─────────────────────────────────────────────────────────────
+
+/**
+ * Generate a SARIF 2.1.0 report from warden verify violations.
+ * The result can be uploaded to GitHub Advanced Security via the
+ * `github/codeql-action/upload-sarif` action.
+ */
+export function generateSarifReport(violations: string[]): object {
+  const sarifResults = violations.map(v => {
+    let ruleId                                         = 'WARDEN003';
+    if (v.includes('not in lockfile')) ruleId          = 'WARDEN004';
+    else if (v.includes('content hash')) ruleId        = 'WARDEN001';
+    else if (v.includes('new capabilities')) ruleId    = 'WARDEN002';
+    const pkgKey                                       = v.split(':')[0];
+    return {
+      ruleId,
+      level: 'error',
+      message: { text: v },
+      locations: [{
+        physicalLocation: {
+          artifactLocation: { uri: `node_modules/${pkgKey?.slice(0, pkgKey?.lastIndexOf('@'))}` },
+        },
+      }],
+    };
+  });
+
+  return {
+    $schema: 'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json',
+    version: '2.1.0',
+    runs: [{
+      tool: {
+        driver: {
+          name: 'warden',
+          version: '0.1.2',
+          informationUri: 'https://github.com/r-seize/warden-sandbox',
+          rules: [
+            { id: 'WARDEN001', name: 'ContentHashChanged', shortDescription: { text: 'Package content changed since last approval' } },
+            { id: 'WARDEN002', name: 'NewCapabilities', shortDescription: { text: 'Package gained new capabilities' } },
+            { id: 'WARDEN003', name: 'PendingReview', shortDescription: { text: 'Package not yet approved' } },
+            { id: 'WARDEN004', name: 'NotInLockfile', shortDescription: { text: 'Package not registered in lockfile' } },
+          ],
+        },
+      },
+      results: sarifResults,
+    }],
+  };
+}
+
 // ─── Dependency graph ─────────────────────────────────────────────────────────
 
 const HIGH_RISK_CAPS = new Set<string>(['network', 'process-spawn', 'dynamic-code', 'native-binding']);
@@ -446,8 +562,8 @@ export function printDepGraph(graph: DepGraph, rootKeys: string[], maxDepth = 3)
     const node = graph.get(key);
     if (!node) return;
 
-    const connector = depth === 0 ? '' : isLast ? '`-- ' : '|-- ';
-    const childPrefix = depth === 0 ? '' : isLast ? '    ' : '|   ';
+    const connector      = depth === 0 ? '' : isLast ? '`-- ' : '|-- ';
+    const childPrefix    = depth === 0 ? '' : isLast ? '    ' : '|   ';
 
     const capStr = node.capabilities.length > 0
       ? '  ' + node.capabilities.map(c => {
@@ -456,8 +572,8 @@ export function printDepGraph(graph: DepGraph, rootKeys: string[], maxDepth = 3)
         }).join(' ')
       : '';
 
-    const alreadySeen = visited.has(key);
-    const nameStr = alreadySeen
+    const alreadySeen    = visited.has(key);
+    const nameStr        = alreadySeen
       ? chalk.dim(`${node.name}@${node.version} (...)`)
       : node.capabilities.some(c => HIGH_RISK_CAPS.has(c))
       ? chalk.bold(`${node.name}@${node.version}`)
@@ -476,8 +592,8 @@ export function printDepGraph(graph: DepGraph, rootKeys: string[], maxDepth = 3)
 
   if (rootKeys.length === 0) {
     // No root specified: show all top-level packages (not a dep of anything)
-    const allDeps = new Set(Array.from(graph.values()).flatMap(n => n.deps));
-    const roots = Array.from(graph.keys()).filter(k => !allDeps.has(k));
+    const allDeps    = new Set(Array.from(graph.values()).flatMap(n => n.deps));
+    const roots      = Array.from(graph.keys()).filter(k => !allDeps.has(k));
     for (let i = 0; i < roots.length; i++) {
       printNode(roots[i], 0, '', i === roots.length - 1);
     }

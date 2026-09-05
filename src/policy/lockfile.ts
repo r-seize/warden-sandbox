@@ -29,15 +29,17 @@ export const LOCKFILE_NAME = 'warden.lock.json';
 export function readLockfile(dir: string): LockfileData | null {
   const lockPath = path.join(dir, LOCKFILE_NAME);
   try {
-    const raw = fs.readFileSync(lockPath, 'utf8');
-    const parsed = JSON.parse(raw) as LockfileData;
+    const raw       = fs.readFileSync(lockPath, 'utf8');
+    const parsed    = JSON.parse(raw) as LockfileData;
     if (parsed.version !== 1) {
       throw new Error(`Unsupported lockfile version: ${parsed.version}`);
     }
     return parsed;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
-    throw err;
+    throw new Error(
+      `Failed to parse ${lockPath}: ${(err as Error).message}. Run "warden scan" to regenerate.`,
+    );
   }
 }
 
@@ -60,8 +62,8 @@ export function mergeLockfile(
   existing: LockfileData | null,
   newEntries: Record<string, PackagePolicy>,
 ): LockfileData {
-  const base = existing ?? createEmptyLockfile();
-  const merged: Record<string, PackagePolicy> = {};
+  const base                                     = existing ?? createEmptyLockfile();
+  const merged: Record<string, PackagePolicy>    = {};
 
   for (const [key, newEntry] of Object.entries(newEntries)) {
     const oldEntry = base.packages[key];
@@ -85,8 +87,8 @@ export function mergeLockfile(
     }
 
     // Content changed: detect new capabilities and downgrade status
-    const oldCaps = new Set(oldEntry.capabilities);
-    const addedCaps = newEntry.capabilities.filter(c => !oldCaps.has(c));
+    const oldCaps      = new Set(oldEntry.capabilities);
+    const addedCaps    = newEntry.capabilities.filter(c => !oldCaps.has(c));
 
     let note: string | undefined;
     if (addedCaps.length > 0) {

@@ -19,14 +19,14 @@ const _require = createRequire(import.meta.url);
 // ── State injected by initialize() ──────────────────────────────────────────
 
 /** @type {object|null} */
-let lockfile = null;
-let enforceMode = false;
-let profile = 'default'; // 'strict' | 'default' | 'lenient'
+let lockfile       = null;
+let enforceMode    = false;
+let profile        = 'default'; // 'strict' | 'default' | 'lenient'
 /** @type {import('node:worker_threads').MessagePort|null} */
 let violationPort = null;
 
-const STRICT_EXTRA_BLOCKED  = new Set(['env-access']);
-const LENIENT_ALWAYS_ALLOWED = new Set(['filesystem-read', 'env-access']);
+const STRICT_EXTRA_BLOCKED      = new Set(['env-access']);
+const LENIENT_ALWAYS_ALLOWED    = new Set(['filesystem-read', 'env-access']);
 
 // ── Capability map ───────────────────────────────────────────────────────────
 
@@ -62,9 +62,9 @@ function normalizeSpecifier(specifier) {
 function getPackageNameFromURL(fileURL) {
   if (!fileURL) return null;
   let filePath;
-  try { filePath = fileURLToPath(fileURL); } catch { return null; }
-  const marker = `node_modules${sep}`;
-  const idx = filePath.lastIndexOf(marker);
+  try { filePath    = fileURLToPath(fileURL); } catch { return null; }
+  const marker      = `node_modules${sep}`;
+  const idx         = filePath.lastIndexOf(marker);
   if (idx === -1) return null;
   const rest = filePath.slice(idx + marker.length);
   if (rest.startsWith('@')) {
@@ -134,11 +134,11 @@ function fireViolation(event) {
  * (ESM named exports must be statically declared).
  */
 function buildBlockedModuleSource(nodeUrl, pkgName, cap) {
-  const moduleName = nodeUrl.replace(/^node:/, '');
-  let namedExports = [];
+  const moduleName    = nodeUrl.replace(/^node:/, '');
+  let namedExports    = [];
   try {
-    const real = _require(moduleName);
-    namedExports = Object.keys(real).filter(k => /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(k));
+    const real      = _require(moduleName);
+    namedExports    = Object.keys(real).filter(k => /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(k));
   } catch { /* ignore */ }
 
   const namedStubs = namedExports.map(name => {
@@ -174,10 +174,10 @@ export default _blocked;
 // ── Hooks ────────────────────────────────────────────────────────────────────
 
 export function initialize({ lockfile: lf, enforce, port, profile: p }) {
-  lockfile = lf;
-  enforceMode = enforce ?? false;
-  profile = p ?? 'default';
-  violationPort = port ?? null;
+  lockfile         = lf;
+  enforceMode      = enforce ?? false;
+  profile          = p ?? 'default';
+  violationPort    = port ?? null;
 }
 
 /**
@@ -190,8 +190,8 @@ export function initialize({ lockfile: lf, enforce, port, profile: p }) {
  * Observation: fire violation and allow through.
  */
 export async function resolve(specifier, context, nextResolve) {
-  const normalized = normalizeSpecifier(specifier);
-  const requiredCap = CAPABILITY_MAP[normalized];
+  const normalized     = normalizeSpecifier(specifier);
+  const requiredCap    = CAPABILITY_MAP[normalized];
   if (!requiredCap) return nextResolve(specifier, context);
 
   const callerPkg = getPackageNameFromURL(context.parentURL);
@@ -219,8 +219,8 @@ export async function resolve(specifier, context, nextResolve) {
   }
 
   // Violation
-  const capForEvent = requiredCap === 'filesystem' ? 'filesystem-read' : requiredCap;
-  const apiName = normalized.replace('node:', '');
+  const capForEvent    = requiredCap === 'filesystem' ? 'filesystem-read' : requiredCap;
+  const apiName        = normalized.replace('node:', '');
 
   fireViolation({ packageName: callerPkg, capability: capForEvent, apiAccessed: apiName });
 

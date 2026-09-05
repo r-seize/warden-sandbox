@@ -39,8 +39,8 @@ export function installEsmLoaderHook(
   // ref() keeps the event loop alive during script execution so we receive events
   port1.ref();
 
-  const hooksFile = path.join(__dirname, 'esmHooks.mjs');
-  const hooksURL = pathToFileURL(hooksFile).href;
+  const hooksFile    = path.join(__dirname, 'esmHooks.mjs');
+  const hooksURL     = pathToFileURL(hooksFile).href;
 
   nodeModule.register(hooksURL, {
     parentURL: pathToFileURL(__filename).href,

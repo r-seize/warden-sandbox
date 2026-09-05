@@ -2,7 +2,7 @@
 
 [![npm version](https://img.shields.io/npm/v/warden-sandbox)](https://www.npmjs.com/package/warden-sandbox)
 [![npm downloads](https://img.shields.io/npm/dt/warden-sandbox)](https://www.npmjs.com/package/warden-sandbox)
-[![CI](https://github.com/r-seize/Warden/actions/workflows/ci.yml/badge.svg)](https://github.com/r-seize/Warden/actions/workflows/ci.yml)
+[![CI](https://github.com/r-seize/warden-sandbox/actions/workflows/ci.yml/badge.svg)](https://github.com/r-seize/warden-sandbox/actions/workflows/ci.yml)
 [![license](https://img.shields.io/npm/l/warden-sandbox)](LICENSE)
 [![node](https://img.shields.io/node/v/warden-sandbox)](https://nodejs.org)
 
@@ -31,6 +31,7 @@ Warden addresses a class of supply-chain attacks where malicious code executes *
   - [warden watch](#warden-watch)
   - [warden integrity](#warden-integrity)
   - [warden config init](#warden-config-init)
+  - [warden config recommend](#warden-config-recommend)
 - [Configuration file](#configuration-file-wardenrcjson)
 - [Lockfile format](#wardenlockjson-format)
 - [Capabilities](#capabilities)
@@ -93,13 +94,14 @@ Scans `node_modules` using static AST analysis and generates or updates `warden.
 Packages already present in the lockfile with a matching SHA-256 content hash are skipped — the scan is incremental and fast on subsequent runs.
 
 ```
-warden scan [--dir <path>] [--no-progress] [--json]
+warden scan [--dir <path>] [--no-progress] [--verbose] [--json]
 ```
 
 | Flag | Description |
 |---|---|
 | `--dir <path>` | Project directory to scan (default: cwd) |
 | `--no-progress` | Suppress the progress bar — useful in CI |
+| `--verbose` | Print per-package timing, file count, and cache hit/miss status |
 | `--json` | Print the resulting lockfile JSON to stdout |
 
 Commit `warden.lock.json` to version control. New packages appear as `pending-review` and must be explicitly approved before enforcement can be enabled.
@@ -157,7 +159,7 @@ Warden Diff
 Compares the current state of `node_modules` against the committed lockfile. Exits `1` if any package has a changed content hash, new capabilities, or a `pending-review` status. Packages listed under `ignore` in `.wardenrc.json` are skipped.
 
 ```
-warden verify [--dir <path>] [--json] [--sarif]
+warden verify [--dir <path>] [--json] [--sarif] [--junit]
 ```
 
 | Flag | Description |
@@ -165,6 +167,7 @@ warden verify [--dir <path>] [--json] [--sarif]
 | `--dir <path>` | Project directory (default: cwd) |
 | `--json` | Output `{ "ok": boolean, "violations": string[] }` |
 | `--sarif` | Output SARIF 2.1.0 JSON for GitHub Advanced Security / code scanning integration |
+| `--junit` | Output JUnit XML for Jenkins, GitLab CI, and other test-report consumers |
 
 ```yaml
 # GitHub Actions
@@ -175,6 +178,9 @@ warden verify [--dir <path>] [--json] [--sarif]
 - uses: github/codeql-action/upload-sarif@v3
   with:
     sarif_file: warden.sarif
+
+# With JUnit XML for GitLab CI / Jenkins
+- run: warden verify --junit > warden-report.xml || true
 ```
 
 ### `warden approve`
@@ -237,6 +243,7 @@ Executes a Node.js script with Warden's module hooks installed. Detects ESM (`.m
 
 ```
 warden run <script> [--enforce] [--watch] [--profile <profile>] [--timeout <ms>] [--dir <path>]
+           [--json] [--on-violation <action>] [--stack]
 ```
 
 | Flag | Description |
@@ -246,6 +253,9 @@ warden run <script> [--enforce] [--watch] [--profile <profile>] [--timeout <ms>]
 | `--profile <profile>` | `strict`, `default`, or `lenient` — see [Profiles](#profiles) |
 | `--timeout <ms>` | Kill the script if it runs longer than N milliseconds |
 | `--dir <path>` | Project directory where `warden.lock.json` lives (default: cwd) |
+| `--json` | Emit violations as NDJSON (`{"level":"warn","source":"warden",...}`) instead of human-readable text |
+| `--on-violation <action>` | `log` (default), `block` (throw on first violation), or `prompt` (interactive) |
+| `--stack` | Capture and attach a V8 stack trace to each violation event |
 
 **Observation mode (default):** every violation is logged and a summary is printed at the end. Execution is never interrupted.
 
@@ -478,7 +488,7 @@ warden integrity [--dir <path>] [--json]
 | `--dir <path>` | Project directory (default: cwd) |
 | `--json` | Output `{ "checked": number, "issues": [{ package, issue }] }` |
 
-Exit codes: `0` = all clear, `1` = issues found.
+Exit codes: `0` = all clear, `2` = issues found.
 
 ```bash
 warden integrity
@@ -520,6 +530,32 @@ Warden config init
     "profile": "strict",
     "ignore": ["internal-pkg"]
   }
+```
+
+### `warden config recommend`
+
+Analyses your `package.json` and generates a recommended `.wardenrc.json` tailored to your project type — no interactive prompts. Detected types: `frontend`, `backend`, `cli`, `library`, `unknown`.
+
+```
+warden config recommend [--dir <path>]
+```
+
+| Project type | Recommended profile | Rationale |
+|---|---|---|
+| `frontend` | `lenient` | Bundlers and dev tools legitimately need broad filesystem and env access |
+| `backend` / `cli` | `default` | Standard enforcement; known network packages added to `ignore` automatically |
+| `library` | `strict` | Minimal surface area — env access blocked even if declared |
+| `unknown` | `default` | Falls back to safe default when type cannot be inferred |
+
+```bash
+warden config recommend
+# Detected project type: backend
+# Recommended .wardenrc.json:
+# {
+#   "profile": "default",
+#   "autoApprove": false,
+#   "ignore": ["axios"]
+# }
 ```
 
 ## Configuration File (`.wardenrc.json`)
@@ -607,6 +643,16 @@ Create it interactively with `warden config init`, or write it manually.
 | `unsandboxed` | Native `.node` addon — cannot be sandboxed. Runs with full OS access. |
 | `unanalyzable` | All JS files failed to parse (obfuscated code). No capability claims can be made. |
 
+## Exit Codes
+
+All Warden commands follow a consistent exit code convention:
+
+| Code | Meaning |
+|---|---|
+| `0` | Success — no issues |
+| `1` | Policy violation — a package violated its declared capability policy |
+| `2` | Runtime error — invalid arguments, missing file, corrupt lockfile, etc. |
+
 ## Profiles
 
 The `--profile` flag (or `profile` in `.wardenrc.json`) adjusts what is enforced beyond the lockfile.
@@ -662,4 +708,4 @@ BSD 2-Clause License — Copyright (c) 2026, r-seize. See [LICENSE](LICENSE).
 
 ## Contributing
 
-Issues and pull requests are welcome at [github.com/r-seize/Warden](https://github.com/r-seize/Warden).
+Issues and pull requests are welcome at [github.com/r-seize/warden-sandbox](https://github.com/r-seize/warden-sandbox).

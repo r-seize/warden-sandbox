@@ -123,15 +123,15 @@ describe('warden run ESM — enforce mode', () => {
 // ─── Error handling ───────────────────────────────────────────────────────────
 
 describe('warden run — error handling', () => {
-  it('missing script: exits 1 with error message', () => {
+  it('missing script: exits 2 with error message', () => {
     const r = warden(['run', 'does-not-exist.js']);
-    expect(r.code).toBe(1);
+    expect(r.code).toBe(2);
     expect(r.output).toContain('Script not found');
   });
 
-  it('missing lockfile: exits 1 with helpful message', () => {
+  it('missing lockfile: exits 2 with helpful message', () => {
     const r = warden(['run', '--dir', '/tmp', fixture('clean-script.js')]);
-    expect(r.code).toBe(1);
+    expect(r.code).toBe(2);
     expect(r.output).toContain('warden.lock.json');
   });
 });

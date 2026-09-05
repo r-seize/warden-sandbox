@@ -28,18 +28,22 @@ import {
   printExplain,
   printDepGraph,
   generateMarkdownReport,
+  generateJUnitReport,
+  generateSarifReport,
+  createProgressPrinter,
 } from './report/cliReport';
 import chalk from 'chalk';
 import { readConfig, isIgnored } from './config';
 import { explainPackage } from './analyzer/explainer';
 import { buildDepGraph } from './analyzer/depGraph';
+import { recommendConfig } from './policy/policyGenerator';
 
 const program = new Command();
 
 program
   .name('warden')
   .description('Runtime capability sandboxing for Node.js dependencies')
-  .version('0.1.1');
+  .version('0.1.2');
 
 // ─── scan ────────────────────────────────────────────────────────────────────
 
@@ -49,39 +53,49 @@ program
   .option('-d, --dir <path>', 'Project directory (default: cwd)', process.cwd())
   .option('--no-progress', 'Disable progress output')
   .option('--json', 'Output raw JSON instead of human-readable report')
-  .action(async (opts: { dir: string; progress: boolean; json: boolean }) => {
-    const projectDir = path.resolve(opts.dir);
-    const nodeModulesDir = path.join(projectDir, 'node_modules');
+  .option('-v, --verbose', 'Show per-package scan timing, file counts, and cache hits')
+  .action(async (opts: { dir: string; progress: boolean; json: boolean; verbose: boolean }) => {
+    const projectDir        = path.resolve(opts.dir);
+    const nodeModulesDir    = path.join(projectDir, 'node_modules');
 
     if (!fs.existsSync(nodeModulesDir)) {
       console.error(chalk.red(`Error: No node_modules found at ${nodeModulesDir}`));
-      console.error('Run npm install first.');
-      process.exit(1);
+      console.error(chalk.dim('  Run `npm install` (or `pnpm install` / `yarn`) first.'));
+      process.exit(2);
     }
 
     // Load existing lockfile to use as scan cache
-    const existing = readLockfile(projectDir);
-    const cache = buildCacheFromLockfile(existing);
+    const existing    = readLockfile(projectDir);
+    const cache       = buildCacheFromLockfile(existing);
 
     if (!opts.json) {
       console.log(chalk.bold(`\nWarden scan — ${projectDir}`));
     }
 
-    const startTime = Date.now();
+    const startTime          = Date.now();
+    const progressPrinter    = opts.progress ? createProgressPrinter() : undefined;
+
+    const verboseLines: string[]    = [];
+    const onVerbose                 = opts.verbose
+      ? (info: { pkg: string; cached: boolean; timeMs: number; fileCount: number }) => {
+          const hit = info.cached ? chalk.green('[cache]') : chalk.dim('[scan] ');
+          verboseLines.push(`  ${hit} ${chalk.dim(info.pkg.padEnd(40))} ${info.fileCount} files  ${info.timeMs}ms`);
+        }
+      : undefined;
 
     const results = await scanNodeModules(
       nodeModulesDir,
       cache,
-      opts.progress
-        ? (done, total, pkg) => printProgress(done, total, pkg)
-        : undefined,
+      progressPrinter,
+      true,
+      onVerbose,
     );
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
     if (opts.json) {
-      const newPolicies = buildPolicyMap(results);
-      const merged = mergeLockfile(existing, newPolicies);
+      const newPolicies    = buildPolicyMap(results);
+      const merged         = mergeLockfile(existing, newPolicies);
       console.log(JSON.stringify(merged, null, 2));
       return;
     }
@@ -89,9 +103,15 @@ program
     printScanSummary(results);
     console.log(chalk.dim(`  Scanned ${results.length} packages in ${elapsed}s`));
 
+    if (opts.verbose && verboseLines.length > 0) {
+      console.log('');
+      console.log(chalk.bold('  Verbose scan details:'));
+      for (const line of verboseLines) console.log(line);
+    }
+
     // Write/update lockfile
-    const newPolicies = buildPolicyMap(results);
-    const merged = mergeLockfile(existing, newPolicies);
+    const newPolicies    = buildPolicyMap(results);
+    const merged         = mergeLockfile(existing, newPolicies);
     writeLockfile(projectDir, merged);
 
     const lockPath = path.join(projectDir, LOCKFILE_NAME);
@@ -131,31 +151,32 @@ program
       if (result.status !== 0 || !result.stdout) {
         console.error(chalk.red(`Error: Could not retrieve warden.lock.json at date "${opts.since}" from git history.`));
         console.error(chalk.dim('  Make sure warden.lock.json is committed and the date is valid (e.g. "2026-08-01").'));
-        process.exit(1);
+        process.exit(2);
       }
       oldLock = JSON.parse(result.stdout) as LockfileData;
     } else if (opts.from) {
-      const raw = fs.readFileSync(path.resolve(opts.from), 'utf8');
-      oldLock = JSON.parse(raw) as LockfileData;
+      const raw    = fs.readFileSync(path.resolve(opts.from), 'utf8');
+      oldLock      = JSON.parse(raw) as LockfileData;
     } else {
       oldLock = readLockfile(projectDir);
     }
 
     if (opts.to) {
-      const raw = fs.readFileSync(path.resolve(opts.to), 'utf8');
-      newLock = JSON.parse(raw) as LockfileData;
+      const raw    = fs.readFileSync(path.resolve(opts.to), 'utf8');
+      newLock      = JSON.parse(raw) as LockfileData;
     } else {
       // Scan current node_modules
       const nodeModulesDir = path.join(projectDir, 'node_modules');
       if (!fs.existsSync(nodeModulesDir)) {
         console.error(chalk.red(`Error: No node_modules at ${nodeModulesDir}`));
-        process.exit(1);
+        console.error(chalk.dim('  Run `warden scan` first, or pass --to <lockfile> to diff against a file.'));
+        process.exit(2);
       }
       const cache = buildCacheFromLockfile(oldLock);
       console.log(chalk.bold('\nWarden — scanning node_modules for diff...'));
-      const results = await scanNodeModules(nodeModulesDir, cache, (d, t, p) => printProgress(d, t, p));
-      const newPolicies = buildPolicyMap(results);
-      newLock = mergeLockfile(null, newPolicies);
+      const results        = await scanNodeModules(nodeModulesDir, cache, (d, t, p) => printProgress(d, t, p));
+      const newPolicies    = buildPolicyMap(results);
+      newLock              = mergeLockfile(null, newPolicies);
     }
 
     const summary = diffLockfiles(oldLock, newLock);
@@ -170,29 +191,32 @@ program
   .option('-d, --dir <path>', 'Project directory (default: cwd)', process.cwd())
   .option('--json', 'Output machine-readable JSON (for CI pipelines)')
   .option('--sarif', 'Output SARIF 2.1.0 JSON (for GitHub Advanced Security / code scanning)')
-  .action(async (opts: { dir: string; json: boolean; sarif: boolean }) => {
-    const projectDir = path.resolve(opts.dir);
-    const existing = readLockfile(projectDir);
+  .option('--junit', 'Output JUnit XML (for Jenkins / GitLab CI test reporters)')
+  .action(async (opts: { dir: string; json: boolean; sarif: boolean; junit: boolean }) => {
+    const projectDir    = path.resolve(opts.dir);
+    const existing      = readLockfile(projectDir);
 
     if (!existing) {
-      console.error(chalk.red('Error: No warden.lock.json found. Run `warden scan` first.'));
-      process.exit(1);
+      console.error(chalk.red('Error: No warden.lock.json found.'));
+      console.error(chalk.dim('  Run `warden scan` first to generate the lockfile.'));
+      process.exit(2);
     }
 
     const nodeModulesDir = path.join(projectDir, 'node_modules');
     if (!fs.existsSync(nodeModulesDir)) {
       console.error(chalk.red(`Error: No node_modules at ${nodeModulesDir}`));
-      process.exit(1);
+      console.error(chalk.dim('  Run `npm install` (or `pnpm install` / `yarn`) first.'));
+      process.exit(2);
     }
 
     const cache = buildCacheFromLockfile(existing);
     console.log(chalk.bold('\nWarden verify — scanning node_modules...'));
-    const results = await scanNodeModules(nodeModulesDir, cache, (d, t, p) => printProgress(d, t, p));
-    const newPolicies = buildPolicyMap(results);
+    const results        = await scanNodeModules(nodeModulesDir, cache, (d, t, p) => printProgress(d, t, p));
+    const newPolicies    = buildPolicyMap(results);
 
-    const config = readConfig(projectDir);
-    const ignoreList = config.ignore ?? [];
-    const violations: string[] = [];
+    const config                  = readConfig(projectDir);
+    const ignoreList              = config.ignore ?? [];
+    const violations: string[]    = [];
 
     for (const [key, newPolicy] of Object.entries(newPolicies)) {
       if (isIgnored(key, ignoreList)) continue;
@@ -209,8 +233,8 @@ program
         continue;
       }
 
-      const lockedCaps = new Set(lockedPolicy.capabilities);
-      const newCaps = newPolicy.capabilities.filter(c => !lockedCaps.has(c));
+      const lockedCaps    = new Set(lockedPolicy.capabilities);
+      const newCaps       = newPolicy.capabilities.filter(c => !lockedCaps.has(c));
       if (newCaps.length > 0) {
         violations.push(`${key}: new capabilities detected: ${newCaps.join(', ')}`);
       }
@@ -231,41 +255,12 @@ program
     const ok = violations.length === 0;
 
     if (opts.sarif) {
-      const sarifResults = violations.map(v => {
-        let ruleId = 'WARDEN003';
-        if (v.includes('not in lockfile')) ruleId = 'WARDEN004';
-        else if (v.includes('content hash')) ruleId = 'WARDEN001';
-        else if (v.includes('new capabilities')) ruleId = 'WARDEN002';
-        const pkgKey = v.split(':')[0];
-        return {
-          ruleId,
-          level: 'error',
-          message: { text: v },
-          locations: [{ physicalLocation: { artifactLocation: { uri: `node_modules/${pkgKey.slice(0, pkgKey.lastIndexOf('@'))}` } } }],
-        };
-      });
+      console.log(JSON.stringify(generateSarifReport(violations), null, 2));
+      process.exit(ok ? 0 : 1);
+    }
 
-      const sarif = {
-        $schema: 'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json',
-        version: '2.1.0',
-        runs: [{
-          tool: {
-            driver: {
-              name: 'warden',
-              version: '0.1.0',
-              informationUri: 'https://github.com/r-seize/Warden',
-              rules: [
-                { id: 'WARDEN001', name: 'ContentHashChanged', shortDescription: { text: 'Package content changed since last approval' } },
-                { id: 'WARDEN002', name: 'NewCapabilities', shortDescription: { text: 'Package gained new capabilities' } },
-                { id: 'WARDEN003', name: 'PendingReview', shortDescription: { text: 'Package not yet approved' } },
-                { id: 'WARDEN004', name: 'NotInLockfile', shortDescription: { text: 'Package not registered in lockfile' } },
-              ],
-            },
-          },
-          results: sarifResults,
-        }],
-      };
-      console.log(JSON.stringify(sarif, null, 2));
+    if (opts.junit) {
+      process.stdout.write(generateJUnitReport(violations));
       process.exit(ok ? 0 : 1);
     }
 
@@ -298,18 +293,19 @@ program
     const VALID_CAPS = new Set(['network', 'process-spawn', 'dynamic-code', 'native-binding', 'filesystem-write', 'env-access', 'filesystem-read']);
     if (opts.capability && !VALID_CAPS.has(opts.capability)) {
       console.error(chalk.red(`Error: Unknown capability "${opts.capability}". Valid values: ${[...VALID_CAPS].join(', ')}`));
-      process.exit(1);
+      process.exit(2);
     }
     if (opts.deny && !VALID_CAPS.has(opts.deny)) {
       console.error(chalk.red(`Error: Unknown capability "${opts.deny}". Valid values: ${[...VALID_CAPS].join(', ')}`));
-      process.exit(1);
+      process.exit(2);
     }
 
     const lockfile = readLockfile(projectDir);
 
     if (!lockfile) {
-      console.error(chalk.red('Error: No warden.lock.json found. Run `warden scan` first.'));
-      process.exit(1);
+      console.error(chalk.red('Error: No warden.lock.json found.'));
+      console.error(chalk.dim('  Run `warden scan` first to generate the lockfile.'));
+      process.exit(2);
     }
 
     if (!opts.all && pkgArgs.length === 0) {
@@ -318,7 +314,7 @@ program
       console.error(chalk.dim('    warden approve axios'));
       console.error(chalk.dim('    warden approve axios lodash debug'));
       console.error(chalk.dim('    warden approve --all'));
-      process.exit(1);
+      process.exit(2);
     }
 
     // Determine which lockfile keys to approve
@@ -360,16 +356,16 @@ program
       const nodeModulesDir = path.join(projectDir, 'node_modules');
       if (fs.existsSync(nodeModulesDir)) {
         console.log(chalk.dim('\n  Re-scanning packages before approving...'));
-        const { scanNodeModules } = await import('./analyzer/packageScanner') as typeof import('./analyzer/packageScanner');
-        const { buildPolicyMap } = await import('./policy/policyGenerator') as typeof import('./policy/policyGenerator');
-        const cache = buildCacheFromLockfile(lockfile);
-        const results = await scanNodeModules(nodeModulesDir, cache);
-        const fresh = buildPolicyMap(results);
+        const { scanNodeModules }    = await import('./analyzer/packageScanner') as typeof import('./analyzer/packageScanner');
+        const { buildPolicyMap }     = await import('./policy/policyGenerator') as typeof import('./policy/policyGenerator');
+        const cache                  = buildCacheFromLockfile(lockfile);
+        const results                = await scanNodeModules(nodeModulesDir, cache);
+        const fresh                  = buildPolicyMap(results);
         // Update capabilities from fresh scan (but don't overwrite status yet)
         for (const [key, newPol] of Object.entries(fresh)) {
           if (lockfile.packages[key]) {
-            lockfile.packages[key].capabilities = newPol.capabilities;
-            lockfile.packages[key].contentHash = newPol.contentHash;
+            lockfile.packages[key].capabilities    = newPol.capabilities;
+            lockfile.packages[key].contentHash     = newPol.contentHash;
           }
         }
       }
@@ -390,8 +386,8 @@ program
         continue;
       }
 
-      const prevStatus = entry.status;
-      entry.status = 'approved';
+      const prevStatus    = entry.status;
+      entry.status        = 'approved';
       delete entry.note;
 
       if (opts.note) { entry.note = opts.note; }
@@ -451,22 +447,36 @@ program
     'Policy profile: strict (additionally blocks env-access), lenient (allows filesystem-read + env-access without approval)',
   )
   .option('--timeout <ms>', 'Kill the script if it runs longer than this many milliseconds')
-  .action(async (scriptArg: string, opts: { dir: string; enforce: boolean; watch: boolean; profile?: string; timeout?: string }) => {
-    const projectDir = path.resolve(opts.dir);
-    const config = readConfig(projectDir);
-    const profile = (opts.profile ?? config.profile ?? 'default') as import('./runtime/moduleLoaderHook').Profile;
-    const timeoutMs = opts.timeout ? parseInt(opts.timeout, 10) : 0;
-    const scriptPath = path.resolve(scriptArg);
+  .option('--json', 'Emit violations as ndjson to stderr instead of human-readable messages')
+  .option(
+    '--on-violation <action>',
+    'What to do on a violation: log (default), block (exit 1), or prompt (interactive)',
+    'log',
+  )
+  .option('--stack', 'Attach a full stack trace to every violation event')
+  .action(async (scriptArg: string, opts: { dir: string; enforce: boolean; watch: boolean; profile?: string; timeout?: string; json: boolean; onViolation: string; stack: boolean }) => {
+    const projectDir    = path.resolve(opts.dir);
+    const config        = readConfig(projectDir);
+    const profile       = (opts.profile ?? config.profile ?? 'default') as import('./runtime/moduleLoaderHook').Profile;
+    const timeoutMs     = opts.timeout ? parseInt(opts.timeout, 10) : 0;
+    const scriptPath    = path.resolve(scriptArg);
 
     if (!fs.existsSync(scriptPath)) {
       console.error(chalk.red(`Error: Script not found: ${scriptPath}`));
-      process.exit(1);
+      console.error(chalk.dim(`  Checked: ${scriptPath}`));
+      process.exit(2);
+    }
+
+    const validOnViolation = ['log', 'block', 'prompt'];
+    if (!validOnViolation.includes(opts.onViolation)) {
+      console.error(chalk.red(`Error: Invalid --on-violation value "${opts.onViolation}". Valid values: ${validOnViolation.join(', ')}`));
+      process.exit(2);
     }
 
     const validProfiles = ['strict', 'default', 'lenient'];
     if (!validProfiles.includes(profile)) {
       console.error(chalk.red(`Error: Invalid profile "${profile}". Valid values: ${validProfiles.join(', ')}`));
-      process.exit(1);
+      process.exit(2);
     }
 
     // --watch: delegate to child processes so hooks can be re-installed each run
@@ -494,29 +504,40 @@ program
 
     const lockfile = readLockfile(projectDir);
     if (!lockfile) {
-      console.error(chalk.red('Error: No warden.lock.json found. Run `warden scan` first.'));
-      process.exit(1);
+      console.error(chalk.red('Error: No warden.lock.json found.'));
+      console.error(chalk.dim('  Run `warden scan` first to generate the lockfile.'));
+      process.exit(2);
     }
 
     // Capture native import() before SES's lockdown() can patch Function.
     // new Function prevents tsc (module: CommonJS) from rewriting import() → require().
     // Must be created before any require('./runtime/...') calls since loading
     // moduleLoaderHook triggers ses/lockdown when --enforce is active.
-    const { pathToFileURL } = require('node:url') as typeof import('node:url');
-    const nativeImport = new Function('url', 'return import(url)') as (url: string) => Promise<unknown>;
+    const { pathToFileURL }    = require('node:url') as typeof import('node:url');
+    const nativeImport         = new Function('url', 'return import(url)') as (url: string) => Promise<unknown>;
 
     // Lazy imports: avoid loading ses before this command is chosen
     // (lockdown() must only be called here, not at module-load time)
-    const { installModuleLoaderHook } = require('./runtime/moduleLoaderHook') as typeof import('./runtime/moduleLoaderHook');
-    const { installEsmLoaderHook } = require('./runtime/esmLoaderHook') as typeof import('./runtime/esmLoaderHook');
-    const { createViolationHandler } = require('./runtime/violationHandler') as typeof import('./runtime/violationHandler');
+    const { installModuleLoaderHook }    = require('./runtime/moduleLoaderHook') as typeof import('./runtime/moduleLoaderHook');
+    const { installEsmLoaderHook }       = require('./runtime/esmLoaderHook') as typeof import('./runtime/esmLoaderHook');
+    const { createViolationHandler }     = require('./runtime/violationHandler') as typeof import('./runtime/violationHandler');
 
-    const violationLog: Array<{ pkg: string; cap: string; api: string }> = [];
+    const violationLog: Array<{ pkg: string; cap: string; api: string; stack?: string }> = [];
+
+    // --on-violation block maps to 'exit' mode; 'log' and 'prompt' both log for now.
+    // 'prompt' is interactive and only meaningful outside --enforce.
+    const resolvedMode = opts.enforce
+      ? 'throw'
+      : opts.onViolation === 'block'
+      ? 'exit'
+      : 'log';
 
     const onViolation = createViolationHandler({
-      mode: opts.enforce ? 'throw' : 'log',
+      mode: resolvedMode,
+      jsonLogging: opts.json,
+      captureStack: opts.stack,
       onViolation: (event) => {
-        violationLog.push({ pkg: event.packageName, cap: event.capability, api: event.apiAccessed });
+        violationLog.push({ pkg: event.packageName, cap: event.capability, api: event.apiAccessed, stack: event.stack });
       },
     });
 
@@ -527,13 +548,15 @@ program
     // we only need to log violations in the main thread.
     const esmOnViolation = createViolationHandler({
       mode: 'log',
+      jsonLogging: opts.json,
+      captureStack: opts.stack,
       onViolation: (event) => {
-        violationLog.push({ pkg: event.packageName, cap: event.capability, api: event.apiAccessed });
+        violationLog.push({ pkg: event.packageName, cap: event.capability, api: event.apiAccessed, stack: event.stack });
       },
     });
 
-    const profileLabel = profile !== 'default' ? chalk.dim(` [${profile}]`) : '';
-    const modeLabel = opts.enforce
+    const profileLabel    = profile !== 'default' ? chalk.dim(` [${profile}]`) : '';
+    const modeLabel       = opts.enforce
       ? chalk.yellow.bold('[Warden] enforce mode active — violations will throw') + profileLabel
       : chalk.cyan.bold('[Warden] observation mode — violations will be logged') + profileLabel;
     console.log('\n' + modeLabel + '\n');
@@ -568,6 +591,12 @@ program
     } finally {
       if (timeoutHandle) clearTimeout(timeoutHandle);
       uninstallCjs();
+      // Drain pending ESM violation port messages before unregistering listeners.
+      // Port messages from the loader thread are macrotasks — one setImmediate tick
+      // lets the poll phase process them before we remove the listener.
+      if (isEsm) {
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
       uninstallEsm();
       if (violationLog.length > 0) {
         console.log(chalk.bold(`\n[Warden] ${violationLog.length} violation(s) recorded:`));
@@ -603,8 +632,8 @@ function isEsmScript(scriptPath: string): boolean {
 }
 
 function buildCacheFromLockfile(lock: LockfileData | null): Map<string, ScanCacheEntry> {
-  const globalCache = loadGlobalCache();
-  const cache = new Map<string, ScanCacheEntry>(globalCache);
+  const globalCache    = loadGlobalCache();
+  const cache          = new Map<string, ScanCacheEntry>(globalCache);
   if (!lock) return cache;
   for (const [key, policy] of Object.entries(lock.packages)) {
     cache.set(key, {
@@ -637,12 +666,13 @@ program
   .description('Show approval status of all packages (reads lockfile, no rescan)')
   .option('-d, --dir <path>', 'Project directory (default: cwd)', process.cwd())
   .action((opts: { dir: string }) => {
-    const projectDir = path.resolve(opts.dir);
-    const lockfile = readLockfile(projectDir);
+    const projectDir    = path.resolve(opts.dir);
+    const lockfile      = readLockfile(projectDir);
 
     if (!lockfile) {
-      console.error(chalk.red('Error: No warden.lock.json found. Run `warden scan` first.'));
-      process.exit(1);
+      console.error(chalk.red('Error: No warden.lock.json found.'));
+      console.error(chalk.dim('  Run `warden scan` first to generate the lockfile.'));
+      process.exit(2);
     }
 
     printStatus(lockfile);
@@ -657,12 +687,13 @@ program
   .option('--json', 'Output raw JSON')
   .option('--fix', 'Auto-approve low-risk pending packages (only env-access and/or filesystem-read)')
   .action((opts: { dir: string; json: boolean; fix: boolean }) => {
-    const projectDir = path.resolve(opts.dir);
-    const lockfile = readLockfile(projectDir);
+    const projectDir    = path.resolve(opts.dir);
+    const lockfile      = readLockfile(projectDir);
 
     if (!lockfile) {
-      console.error(chalk.red('Error: No warden.lock.json found. Run `warden scan` first.'));
-      process.exit(1);
+      console.error(chalk.red('Error: No warden.lock.json found.'));
+      console.error(chalk.dim('  Run `warden scan` first to generate the lockfile.'));
+      process.exit(2);
     }
 
     if (opts.json) {
@@ -713,13 +744,13 @@ program
   .option('--approve-all', 'Auto-approve all new packages after install (skips review prompt)')
   .allowUnknownOption()
   .action(async (pkgArgs: string[], opts: { dir: string; approveAll: boolean }, cmd) => {
-    const projectDir = path.resolve(opts.dir);
-    const config = readConfig(projectDir);
-    const approveAll = opts.approveAll || (config.autoApprove ?? false);
+    const projectDir    = path.resolve(opts.dir);
+    const config        = readConfig(projectDir);
+    const approveAll    = opts.approveAll || (config.autoApprove ?? false);
 
-    const pm = detectPackageManager(projectDir);
-    const unknownArgs = cmd.args.filter((a: string) => !pkgArgs.includes(a));
-    const pmArgs = ['install', ...pkgArgs, ...unknownArgs];
+    const pm             = detectPackageManager(projectDir);
+    const unknownArgs    = cmd.args.filter((a: string) => !pkgArgs.includes(a));
+    const pmArgs         = ['install', ...pkgArgs, ...unknownArgs];
 
     console.log(chalk.bold(`\nWarden install — running ${pm} ${pmArgs.join(' ')}\n`));
 
@@ -743,16 +774,16 @@ program
 
     console.log(chalk.bold('\nWarden install — scanning for new capabilities...\n'));
 
-    const existing = readLockfile(projectDir);
-    const cache = buildCacheFromLockfile(existing);
+    const existing    = readLockfile(projectDir);
+    const cache       = buildCacheFromLockfile(existing);
     const results = await scanNodeModules(
       nodeModulesDir,
       cache,
       (done, total, pkg) => printProgress(done, total, pkg),
     );
 
-    const newPolicies = buildPolicyMap(results);
-    const merged = mergeLockfile(existing, newPolicies);
+    const newPolicies    = buildPolicyMap(results);
+    const merged         = mergeLockfile(existing, newPolicies);
     writeLockfile(projectDir, merged);
 
     const newPending = Object.entries(merged.packages).filter(([, p]) => p.status === 'pending-review');
@@ -791,13 +822,13 @@ program
   .option('--approve-all', 'Auto-approve all changed packages after update (skips review prompt)')
   .allowUnknownOption()
   .action(async (pkgArgs: string[], opts: { dir: string; approveAll: boolean }, cmd) => {
-    const projectDir = path.resolve(opts.dir);
-    const config = readConfig(projectDir);
-    const approveAll = opts.approveAll || (config.autoApprove ?? false);
+    const projectDir    = path.resolve(opts.dir);
+    const config        = readConfig(projectDir);
+    const approveAll    = opts.approveAll || (config.autoApprove ?? false);
 
-    const pm = detectPackageManager(projectDir);
-    const unknownArgs = cmd.args.filter((a: string) => !pkgArgs.includes(a));
-    const pmArgs = ['update', ...pkgArgs, ...unknownArgs];
+    const pm             = detectPackageManager(projectDir);
+    const unknownArgs    = cmd.args.filter((a: string) => !pkgArgs.includes(a));
+    const pmArgs         = ['update', ...pkgArgs, ...unknownArgs];
 
     console.log(chalk.bold(`\nWarden update — running ${pm} ${pmArgs.join(' ')}\n`));
 
@@ -820,16 +851,16 @@ program
 
     console.log(chalk.bold('\nWarden update — scanning for capability changes...\n'));
 
-    const existing = readLockfile(projectDir);
-    const cache = buildCacheFromLockfile(existing);
+    const existing    = readLockfile(projectDir);
+    const cache       = buildCacheFromLockfile(existing);
     const results = await scanNodeModules(
       nodeModulesDir,
       cache,
       (done, total, pkg) => printProgress(done, total, pkg),
     );
 
-    const newPolicies = buildPolicyMap(results);
-    const merged = mergeLockfile(existing, newPolicies);
+    const newPolicies    = buildPolicyMap(results);
+    const merged         = mergeLockfile(existing, newPolicies);
     writeLockfile(projectDir, merged);
 
     const newPending = Object.entries(merged.packages).filter(([, p]) => p.status === 'pending-review');
@@ -867,12 +898,13 @@ program
   .option('-d, --dir <path>', 'Project directory (default: cwd)', process.cwd())
   .option('--json', 'Output raw JSON')
   .action((pkgArg: string, opts: { dir: string; json: boolean }) => {
-    const projectDir = path.resolve(opts.dir);
-    const nodeModulesDir = path.join(projectDir, 'node_modules');
+    const projectDir        = path.resolve(opts.dir);
+    const nodeModulesDir    = path.join(projectDir, 'node_modules');
 
     if (!fs.existsSync(nodeModulesDir)) {
       console.error(chalk.red(`Error: No node_modules at ${nodeModulesDir}`));
-      process.exit(1);
+      console.error(chalk.dim('  Run `npm install` (or `pnpm install` / `yarn`) first.'));
+      process.exit(2);
     }
 
     const result = explainPackage(nodeModulesDir, pkgArg);
@@ -893,17 +925,19 @@ program
   .option('-d, --dir <path>', 'Project directory (default: cwd)', process.cwd())
   .option('--all', 'Unapprove all currently approved packages')
   .action((pkgArgs: string[], opts: { dir: string; all: boolean }) => {
-    const projectDir = path.resolve(opts.dir);
-    const lockfile = readLockfile(projectDir);
+    const projectDir    = path.resolve(opts.dir);
+    const lockfile      = readLockfile(projectDir);
 
     if (!lockfile) {
-      console.error(chalk.red('Error: No warden.lock.json found. Run `warden scan` first.'));
-      process.exit(1);
+      console.error(chalk.red('Error: No warden.lock.json found.'));
+      console.error(chalk.dim('  Run `warden scan` first to generate the lockfile.'));
+      process.exit(2);
     }
 
     if (!opts.all && pkgArgs.length === 0) {
       console.error(chalk.red('Error: Specify package name(s) or use --all.'));
-      process.exit(1);
+      console.error(chalk.dim('  Examples: warden unapprove axios   or   warden unapprove --all'));
+      process.exit(2);
     }
 
     let keysToUnapprove: string[];
@@ -961,22 +995,24 @@ program
   .option('--depth <n>', 'Maximum depth to display (default: 3)', '3')
   .option('--json', 'Output raw JSON')
   .action((pkgArg: string | undefined, opts: { dir: string; depth: string; json: boolean }) => {
-    const projectDir = path.resolve(opts.dir);
-    const nodeModulesDir = path.join(projectDir, 'node_modules');
-    const lockfile = readLockfile(projectDir);
+    const projectDir        = path.resolve(opts.dir);
+    const nodeModulesDir    = path.join(projectDir, 'node_modules');
+    const lockfile          = readLockfile(projectDir);
 
     if (!lockfile) {
-      console.error(chalk.red('Error: No warden.lock.json found. Run `warden scan` first.'));
-      process.exit(1);
+      console.error(chalk.red('Error: No warden.lock.json found.'));
+      console.error(chalk.dim('  Run `warden scan` first to generate the lockfile.'));
+      process.exit(2);
     }
 
     if (!fs.existsSync(nodeModulesDir)) {
       console.error(chalk.red(`Error: No node_modules at ${nodeModulesDir}`));
-      process.exit(1);
+      console.error(chalk.dim('  Run `npm install` (or `pnpm install` / `yarn`) first.'));
+      process.exit(2);
     }
 
-    const graph = buildDepGraph(nodeModulesDir, lockfile);
-    const maxDepth = parseInt(opts.depth, 10) || 3;
+    const graph       = buildDepGraph(nodeModulesDir, lockfile);
+    const maxDepth    = parseInt(opts.depth, 10) || 3;
 
     if (opts.json) {
       const obj: Record<string, unknown> = {};
@@ -1018,8 +1054,9 @@ program
       : path.join(projectDir, 'node_modules', '.package-lock.json');
 
     if (!fs.existsSync(lockJsonPath)) {
-      console.error(chalk.red('Error: No package-lock.json found. Run `npm install` first.'));
-      process.exit(1);
+      console.error(chalk.red('Error: No package-lock.json found.'));
+      console.error(chalk.dim('  Run `npm install` first to generate a package-lock.json.'));
+      process.exit(2);
     }
 
     let pkgLock: {
@@ -1031,15 +1068,16 @@ program
       pkgLock = JSON.parse(fs.readFileSync(lockJsonPath, 'utf8'));
     } catch {
       console.error(chalk.red('Error: Could not parse package-lock.json.'));
-      process.exit(1);
+      console.error(chalk.dim('  The file may be corrupted. Try deleting it and running `npm install` again.'));
+      process.exit(2);
     }
 
     interface IntegrityIssue {
       package: string;
       issue: string;
     }
-    const issues: IntegrityIssue[] = [];
-    const checked: string[] = [];
+    const issues: IntegrityIssue[]    = [];
+    const checked: string[]           = [];
 
     // Support both lockfileVersion 1 (dependencies) and 2/3 (packages)
     const entries = pkgLock.packages
@@ -1098,16 +1136,17 @@ program
   .option('--output <file>', 'Output file path (default: warden-report.md)', 'warden-report.md')
   .option('--format <fmt>', 'Output format (default: md)', 'md')
   .action((opts: { dir: string; output: string; format: string }) => {
-    const projectDir = path.resolve(opts.dir);
-    const lockfile = readLockfile(projectDir);
+    const projectDir    = path.resolve(opts.dir);
+    const lockfile      = readLockfile(projectDir);
 
     if (!lockfile) {
-      console.error(chalk.red('Error: No warden.lock.json found. Run `warden scan` first.'));
-      process.exit(1);
+      console.error(chalk.red('Error: No warden.lock.json found.'));
+      console.error(chalk.dim('  Run `warden scan` first to generate the lockfile.'));
+      process.exit(2);
     }
 
-    const md = generateMarkdownReport(lockfile);
-    const outPath = path.resolve(opts.output);
+    const md         = generateMarkdownReport(lockfile);
+    const outPath    = path.resolve(opts.output);
     fs.writeFileSync(outPath, md, 'utf8');
     console.log(chalk.green(`\n  Warden report written to ${outPath}`));
   });
@@ -1119,8 +1158,8 @@ program
   .description('Watch node_modules for changes and auto-rescan on dependency updates')
   .option('-d, --dir <path>', 'Project directory (default: cwd)', process.cwd())
   .action(async (opts: { dir: string }) => {
-    const projectDir = path.resolve(opts.dir);
-    const nodeModulesDir = path.join(projectDir, 'node_modules');
+    const projectDir        = path.resolve(opts.dir);
+    const nodeModulesDir    = path.join(projectDir, 'node_modules');
 
     if (!fs.existsSync(nodeModulesDir)) {
       console.error(chalk.red(`Error: No node_modules at ${nodeModulesDir}`));
@@ -1142,10 +1181,10 @@ program
     const rescan = async () => {
       console.log(chalk.dim('\n[warden watch] Change detected — rescanning...'));
       try {
-        const cache = buildCacheFromLockfile(currentLock);
-        const results = await scanNodeModules(nodeModulesDir, cache);
-        const newPolicies = buildPolicyMap(results);
-        const newLock = mergeLockfile(null, newPolicies);
+        const cache          = buildCacheFromLockfile(currentLock);
+        const results        = await scanNodeModules(nodeModulesDir, cache);
+        const newPolicies    = buildPolicyMap(results);
+        const newLock        = mergeLockfile(null, newPolicies);
 
         const summary = diffLockfiles(currentLock, newLock);
         printDiffSummary(summary, false);
@@ -1175,8 +1214,8 @@ configCmd
   .description('Interactively create a .wardenrc.json configuration file')
   .option('-d, --dir <path>', 'Project directory (default: cwd)', process.cwd())
   .action(async (opts: { dir: string }) => {
-    const projectDir = path.resolve(opts.dir);
-    const configPath = path.join(projectDir, '.wardenrc.json');
+    const projectDir    = path.resolve(opts.dir);
+    const configPath    = path.join(projectDir, '.wardenrc.json');
 
     if (fs.existsSync(configPath)) {
       console.log(chalk.yellow(`\n  .wardenrc.json already exists at ${configPath}`));
@@ -1184,8 +1223,8 @@ configCmd
       return;
     }
 
-    const readline = await import('node:readline');
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const readline    = await import('node:readline');
+    const rl          = readline.createInterface({ input: process.stdin, output: process.stdout });
 
     const ask = (q: string): Promise<string> =>
       new Promise(resolve => rl.question(q, answer => resolve(answer.trim())));
@@ -1195,14 +1234,14 @@ configCmd
     console.log(chalk.dim('  This will create a .wardenrc.json in your project directory.'));
     console.log('');
 
-    const profileAnswer = await ask('  Default profile [strict/default/lenient] (default: default): ');
-    const profile = ['strict', 'default', 'lenient'].includes(profileAnswer) ? profileAnswer : 'default';
+    const profileAnswer    = await ask('  Default profile [strict/default/lenient] (default: default): ');
+    const profile          = ['strict', 'default', 'lenient'].includes(profileAnswer) ? profileAnswer : 'default';
 
-    const autoApproveAnswer = await ask('  Auto-approve new packages after warden install/update? [y/N]: ');
-    const autoApprove = autoApproveAnswer.toLowerCase() === 'y';
+    const autoApproveAnswer    = await ask('  Auto-approve new packages after warden install/update? [y/N]: ');
+    const autoApprove          = autoApproveAnswer.toLowerCase() === 'y';
 
-    const ignoreAnswer = await ask('  Packages to ignore in warden verify (comma-separated, leave empty for none): ');
-    const ignore = ignoreAnswer ? ignoreAnswer.split(',').map(s => s.trim()).filter(Boolean) : [];
+    const ignoreAnswer    = await ask('  Packages to ignore in warden verify (comma-separated, leave empty for none): ');
+    const ignore          = ignoreAnswer ? ignoreAnswer.split(',').map(s => s.trim()).filter(Boolean) : [];
 
     rl.close();
 
@@ -1218,6 +1257,49 @@ configCmd
     console.log(chalk.green(`  Created .wardenrc.json:`));
     console.log(chalk.dim('  ' + JSON.stringify(config, null, 2).replace(/\n/g, '\n  ')));
     console.log('');
+  });
+
+// ─── config recommend ─────────────────────────────────────────────────────────
+
+configCmd
+  .command('recommend')
+  .description('Analyse the project and suggest a .wardenrc.json configuration')
+  .option('-d, --dir <path>', 'Project directory (default: cwd)', process.cwd())
+  .option('--write', 'Write the recommended config to .wardenrc.json (will not overwrite an existing file)')
+  .action((opts: { dir: string; write: boolean }) => {
+    const projectDir     = path.resolve(opts.dir);
+    const pkgJsonPath    = path.join(projectDir, 'package.json');
+
+    if (!fs.existsSync(pkgJsonPath)) {
+      console.error(chalk.red('Error: No package.json found. This command must be run in a Node.js project directory.'));
+      process.exit(2);
+    }
+
+    const rec                                         = recommendConfig(projectDir);
+    const { _projectType: projectType, ...config }    = rec;
+
+    console.log('');
+    console.log(chalk.bold('Warden config recommend'));
+    console.log(chalk.dim(`  Detected project type: ${chalk.white(projectType)}`));
+    console.log('');
+    console.log(chalk.bold('  Recommended .wardenrc.json:'));
+    console.log('');
+    console.log('  ' + JSON.stringify(config, null, 2).replace(/\n/g, '\n  '));
+    console.log('');
+
+    const configPath = path.join(projectDir, '.wardenrc.json');
+
+    if (opts.write) {
+      if (fs.existsSync(configPath)) {
+        console.log(chalk.yellow(`  .wardenrc.json already exists at ${configPath} — not overwriting.`));
+        console.log(chalk.dim('  Delete it first if you want to apply the recommendation.'));
+      } else {
+        fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+        console.log(chalk.green(`  Written to ${configPath}`));
+      }
+    } else {
+      console.log(chalk.dim('  Run with --write to apply this config, or edit it manually.'));
+    }
   });
 
 program.parse();

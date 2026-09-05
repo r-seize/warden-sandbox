@@ -43,9 +43,9 @@ function makeBlockedProxy(pkgName: string, moduleName: string, cap: Capability, 
 }
 
 function buildTamedFs(caps: Set<Capability>, pkgName: string, onViolation: ViolationFn): Record<string, unknown> {
-  const tamed: Record<string, unknown> = {};
-  const fsAny = nodeFs as unknown as Record<string, unknown>;
-  const promisesAny = nodeFs.promises as unknown as Record<string, unknown>;
+  const tamed: Record<string, unknown>    = {};
+  const fsAny                             = nodeFs as unknown as Record<string, unknown>;
+  const promisesAny                       = nodeFs.promises as unknown as Record<string, unknown>;
 
   const block = (methodName: string, cap: Capability) => () => {
     onViolation({ packageName: pkgName, capability: cap, apiAccessed: `fs.${methodName}` });
@@ -83,8 +83,8 @@ function buildTamedFs(caps: Set<Capability>, pkgName: string, onViolation: Viola
         : block(`promises.${method}`, 'filesystem-write');
     }
   }
-  tamed.promises = tamedPromises;
-  tamed.constants = nodeFs.constants;
+  tamed.promises     = tamedPromises;
+  tamed.constants    = nodeFs.constants;
 
   return tamed;
 }
@@ -121,7 +121,10 @@ function buildTamedProcess(caps: Set<Capability>, pkgName: string, onViolation: 
     nextTick:   process.nextTick.bind(process),
     hrtime:     process.hrtime.bind(process),
     uptime:     process.uptime.bind(process),
-    exit:       process.exit.bind(process),
+    exit:       (_code?: number) => {
+      onViolation({ packageName: pkgName, capability: 'process-spawn', apiAccessed: 'process.exit' });
+      throw new Error(`[Warden] process.exit blocked for ${pkgName}`);
+    },
     stdout:     process.stdout,
     stderr:     process.stderr,
     stdin:      process.stdin,
@@ -274,5 +277,5 @@ export function evaluateInCompartment(
 export function clearCompartmentCache(): void {
   compartmentCache.clear();
   moduleCache.clear();
-  lockdownDone = false;
+  // lockdownDone intentionally NOT reset — lockdown() is a one-time operation that cannot be undone
 }

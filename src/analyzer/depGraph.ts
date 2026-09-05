@@ -16,9 +16,9 @@ export function buildDepGraph(nodeModulesDir: string, lockfile: LockfileData): D
   const graph: DepGraph = new Map();
 
   for (const [key, policy] of Object.entries(lockfile.packages)) {
-    const atIdx = key.lastIndexOf('@');
-    const name = key.slice(0, atIdx);
-    const version = key.slice(atIdx + 1);
+    const atIdx      = key.lastIndexOf('@');
+    const name       = key.slice(0, atIdx);
+    const version    = key.slice(atIdx + 1);
 
     // Find package dir
     const pkgDir = name.startsWith('@')
@@ -39,8 +39,8 @@ export function buildDepGraph(nodeModulesDir: string, lockfile: LockfileData): D
           const depPkgPath = depName.startsWith('@')
             ? path.join(nodeModulesDir, ...depName.split('/'), 'package.json')
             : path.join(nodeModulesDir, depName, 'package.json');
-          const depPkg = JSON.parse(fs.readFileSync(depPkgPath, 'utf8')) as { version?: string };
-          if (depPkg.version) installedKey = `${depName}@${depPkg.version}`;
+          const depPkg                        = JSON.parse(fs.readFileSync(depPkgPath, 'utf8')) as { version?: string };
+          if (depPkg.version) installedKey    = `${depName}@${depPkg.version}`;
         } catch { /* dep may not be installed or package.json missing */ }
 
         const depKey = installedKey && lockfile.packages[installedKey]

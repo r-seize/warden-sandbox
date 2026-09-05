@@ -7,21 +7,21 @@ export type Capability =
   | 'dynamic-code'
   | 'native-binding';
 
-// Modules whose mere require() implies a capability unconditionally.
+// Modules whose mere require()/import implies a capability unconditionally.
 // fs is handled separately because we distinguish read vs write.
 export const SENSITIVE_MODULES: Record<string, Capability[]> = {
-  net:           ['network'],
-  http:          ['network'],
-  https:         ['network'],
-  dns:           ['network'],
-  'dns/promises':['network'],
-  tls:           ['network'],
-  dgram:         ['network'],
-  http2:         ['network'],
-  child_process: ['process-spawn'],
-  cluster:       ['process-spawn'],
-  worker_threads:['process-spawn'],
-  vm:            ['dynamic-code'],
+  net:                  ['network'],
+  http:                 ['network'],
+  https:                ['network'],
+  dns:                  ['network'],
+  'dns/promises':       ['network'],
+  tls:                  ['network'],
+  dgram:                ['network'],
+  http2:                ['network'],
+  child_process:        ['process-spawn'],
+  cluster:              ['process-spawn'],
+  worker_threads:       ['process-spawn'],
+  vm:                   ['dynamic-code'],
   'node:net':           ['network'],
   'node:http':          ['network'],
   'node:https':         ['network'],
@@ -45,7 +45,7 @@ export const FS_READ_METHODS = new Set([
   'access', 'accessSync',
   'exists', 'existsSync',
   'lstat', 'lstatSync',
-  'open', 'openSync',         // conservative: could be read or write; flagged as read
+  'open', 'openSync',
   'read', 'readSync',
   'readdir', 'readdirSync',
   'readFile', 'readFileSync',
@@ -54,15 +54,17 @@ export const FS_READ_METHODS = new Set([
   'stat', 'statSync',
   'fstat', 'fstatSync',
   'createReadStream',
-  'watch', 'watchFile',
+  'watch', 'watchFile', 'unwatchFile',
   'glob', 'globSync',
+  // Directory handle (read-only semantics)
+  'opendir', 'opendirSync',
 ]);
 
 export const FS_WRITE_METHODS = new Set([
   'appendFile', 'appendFileSync',
   'chmod', 'chmodSync', 'fchmod', 'fchmodSync',
-  'chown', 'chownSync', 'fchown', 'fchownSync',
-  'close', 'closeSync',                          // part of write flow
+  'chown', 'chownSync', 'fchown', 'fchownSync', 'lchown', 'lchownSync',
+  'close', 'closeSync',
   'copyFile', 'copyFileSync',
   'cp', 'cpSync',
   'link', 'linkSync',
@@ -75,7 +77,9 @@ export const FS_WRITE_METHODS = new Set([
   'truncate', 'truncateSync', 'ftruncate', 'ftruncateSync',
   'unlink', 'unlinkSync',
   'utimes', 'utimesSync', 'futimes', 'futimesSync',
+  'lutimes', 'lutimesSync',
   'write', 'writeSync',
   'writeFile', 'writeFileSync',
+  'writev', 'writevSync',
   'createWriteStream',
 ]);
