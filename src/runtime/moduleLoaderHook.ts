@@ -64,10 +64,82 @@ function getPolicy(lockfile: LockfileData, pkgName: string): PackagePolicy | nul
   return key ? (lockfile.packages[key] ?? null) : null;
 }
 
+// ─── Shared compartment-evaluation path ───────────────────────────────────────
+
+/** Build a placeholder CJSModule to stand in for a missing parent (top-level requires). */
+function syntheticModule(filename: string, parent: CJSModule | null): CJSModule {
+  return {
+    filename,
+    id: filename,
+    exports: {},
+    loaded: false,
+    parent,
+    children: [],
+    paths: [],
+    require: (() => {}) as unknown as CJSModule['require'],
+  };
+}
+
+/**
+ * Resolve `resolvedFilename` and, in enforce mode, evaluate it inside a ses
+ * Compartment scoped to its owning package's approved capabilities. Falls back
+ * to `fallback()` for JSON/.node files, unreadable files, or any evaluation
+ * error — this is the single code path shared by the top-level `_load` hook
+ * and the controlled `require` passed into each Compartment, so a fix here
+ * (e.g. the extension skip) applies uniformly to both.
+ */
+function loadInCompartment(
+  resolvedFilename: string,
+  callerModule: CJSModule,
+  lockfile: LockfileData,
+  onViolation: ViolationFn,
+  enforce: boolean,
+  originalLoad: typeof NodeModulePrivate._load,
+  profile: Profile,
+  fallback: () => unknown,
+): unknown {
+  const ext = nodePath.extname(resolvedFilename).toLowerCase();
+  if (ext === '.json' || ext === '.node') return fallback();
+
+  let source: string;
+  try {
+    source = nodeFs.readFileSync(resolvedFilename, 'utf8');
+  } catch {
+    return fallback();
+  }
+
+  const targetPkgName    = getPackageNameFromPath(resolvedFilename) ?? resolvedFilename;
+  const targetPolicy     = getPolicy(lockfile, targetPkgName);
+  const targetCaps       = targetPolicy ? effectiveCaps(targetPolicy, profile, enforce) : new Set<Capability>();
+
+  const ctx: PackageEvalContext = {
+    packageName: targetPkgName,
+    caps: targetCaps,
+    onViolation,
+    controlledRequire: buildControlledRequire(
+      targetPkgName,
+      targetCaps,
+      lockfile,
+      onViolation,
+      enforce,
+      originalLoad,
+      syntheticModule(resolvedFilename, callerModule),
+      profile,
+    ),
+  };
+
+  try {
+    return evaluateInCompartment(resolvedFilename, source, ctx);
+  } catch {
+    // Compartment evaluation failed — fall back to normal load
+    // (this can happen with binary extensions, JSON, etc.)
+    return fallback();
+  }
+}
+
 // ─── Controlled require builder ───────────────────────────────────────────────
 
 function buildControlledRequire(
-  _callerFilename: string,
   callerPkgName: string,
   caps: Set<Capability>,
   lockfile: LockfileData,
@@ -78,11 +150,11 @@ function buildControlledRequire(
   profile: Profile = 'default',
 ): (request: string) => unknown {
   return function controlledRequire(request: string): unknown {
-    const isBuiltin = NodeModulePrivate.isBuiltin(request);
-
-    if (isBuiltin) {
+    if (NodeModulePrivate.isBuiltin(request)) {
       return buildTamedBuiltin(request, caps, callerPkgName, onViolation);
     }
+
+    const fallback = () => originalLoad(request, callerModule, false);
 
     // Resolve to absolute path
     let resolvedFilename: string;
@@ -90,64 +162,12 @@ function buildControlledRequire(
       resolvedFilename = NodeModulePrivate._resolveFilename(request, callerModule, false);
     } catch {
       // Let original handle resolution errors
-      return originalLoad(request, callerModule, false);
+      return fallback();
     }
 
-    if (enforce) {
-      // Determine which package the required module belongs to
-      const targetPkgName                  = getPackageNameFromPath(resolvedFilename);
-      const targetPolicy                   = targetPkgName ? getPolicy(lockfile, targetPkgName) : null;
-      const targetCaps: Set<Capability>    = targetPolicy
-        ? effectiveCaps(targetPolicy, profile, enforce)
-        : new Set<Capability>();
+    if (!enforce) return fallback();
 
-      // Read source and evaluate in Compartment
-      let source: string;
-      try {
-        source = nodeFs.readFileSync(resolvedFilename, 'utf8');
-      } catch {
-        // Binary or unreadable — fall back to original loader
-        return originalLoad(request, callerModule, false);
-      }
-
-      const ctx: PackageEvalContext = {
-        packageName: targetPkgName ?? resolvedFilename,
-        caps: targetCaps,
-        onViolation,
-        // The controlled require for the sub-module is itself controlled
-        controlledRequire: buildControlledRequire(
-          resolvedFilename,
-          targetPkgName ?? resolvedFilename,
-          targetCaps,
-          lockfile,
-          onViolation,
-          enforce,
-          originalLoad,
-          {
-            filename: resolvedFilename,
-            id: resolvedFilename,
-            exports: {},
-            loaded: false,
-            parent: callerModule,
-            children: [],
-            paths: [],
-            require: (() => {}) as unknown as CJSModule['require'],
-          },
-          profile,
-        ),
-      };
-
-      try {
-        return evaluateInCompartment(resolvedFilename, source, ctx);
-      } catch {
-        // Compartment evaluation failed — fall back to normal load
-        // (this can happen with binary extensions, JSON, etc.)
-        return originalLoad(request, callerModule, false);
-      }
-    }
-
-    // Observation mode: delegate to original loader
-    return originalLoad(request, callerModule, false);
+    return loadInCompartment(resolvedFilename, callerModule, lockfile, onViolation, enforce, originalLoad, profile, fallback);
   };
 }
 
@@ -251,71 +271,22 @@ export function installModuleLoaderHook(
       return buildTamedBuiltin(request, caps, callerPkgName, onViolation);
     }
 
+    const fallback = () => orig(request, parent, isMain);
+
     if (enforce) {
-      // Resolve filename
       let resolvedFilename: string;
       try {
         resolvedFilename = NodeModulePrivate._resolveFilename(request, parent, isMain);
       } catch {
-        return orig(request, parent, isMain);
+        return fallback();
       }
 
-      // Skip JSON, .node addons — let original loader handle them
-      const ext = nodePath.extname(resolvedFilename).toLowerCase();
-      if (ext === '.json' || ext === '.node') {
-        return orig(request, parent, isMain);
-      }
-
-      // Read and evaluate in Compartment
-      let source: string;
-      try {
-        source = nodeFs.readFileSync(resolvedFilename, 'utf8');
-      } catch {
-        return orig(request, parent, isMain);
-      }
-
-      const targetPkgName    = getPackageNameFromPath(resolvedFilename) ?? resolvedFilename;
-      const targetPolicy     = getPolicy(lockfile, targetPkgName);
-      const targetCaps       = targetPolicy
-        ? effectiveCaps(targetPolicy, profile, enforce)
-        : new Set<Capability>();
-
-      const ctx: PackageEvalContext = {
-        packageName: targetPkgName,
-        caps: targetCaps,
-        onViolation,
-        controlledRequire: buildControlledRequire(
-          resolvedFilename,
-          targetPkgName,
-          targetCaps,
-          lockfile,
-          onViolation,
-          enforce,
-          orig,
-          parent ?? ({
-            filename: '',
-            id: '',
-            exports: {},
-            loaded: true,
-            parent: null,
-            children: [],
-            paths: [],
-            require: (() => {}) as unknown as CJSModule['require'],
-          }),
-          profile,
-        ),
-      };
-
-      try {
-        return evaluateInCompartment(resolvedFilename, source, ctx);
-      } catch {
-        // Fall back to normal load on compartment error
-        return orig(request, parent, isMain);
-      }
+      const callerModule = parent ?? syntheticModule('', null);
+      return loadInCompartment(resolvedFilename, callerModule, lockfile, onViolation, enforce, orig, profile, fallback);
     }
 
     // Observation mode: just delegate
-    return orig(request, parent, isMain);
+    return fallback();
   };
 
   // Return an uninstall function

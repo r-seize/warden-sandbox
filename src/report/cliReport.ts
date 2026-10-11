@@ -6,6 +6,7 @@ import { LockfileData, PackageStatus } from '../policy/lockfile';
 import { PackageExplainResult } from '../analyzer/explainer';
 import { DepGraph } from '../analyzer/depGraph';
 import { riskScore, riskLabel } from '../analyzer/riskScore';
+import { VERSION } from '../version';
 
 // ─── Capability formatting ───────────────────────────────────────────────────
 
@@ -93,6 +94,24 @@ export function printScanSummary(results: PackageScanResult[]): void {
     console.log(chalk.bgRed.white(' WARNING ') + chalk.bold(' Native addons found — these packages CANNOT be sandboxed:'));
     for (const r of unsandboxed) {
       console.log(`  ${chalk.red('-')} ${r.name}@${r.version}`);
+    }
+    console.log('');
+  }
+
+  const withLifecycleScripts = results.filter(r => r.lifecycleScripts.length > 0);
+  if (withLifecycleScripts.length > 0) {
+    console.log(chalk.yellow.bold('  Packages with install-time life-cycle scripts (not covered by load-time sandboxing):'));
+    for (const r of withLifecycleScripts) {
+      console.log(`  ${chalk.yellow('-')} ${r.name}@${r.version}  ${chalk.dim(`[${r.lifecycleScripts.join(', ')}]`)}`);
+    }
+    console.log('');
+  }
+
+  const possibleTyposquats = results.filter(r => r.typosquatOf);
+  if (possibleTyposquats.length > 0) {
+    console.log(chalk.bgRed.white(' WARNING ') + chalk.bold(' Possible typosquats — verify these are the packages you meant to install:'));
+    for (const r of possibleTyposquats) {
+      console.log(`  ${chalk.red('-')} ${r.name}@${r.version}  ${chalk.dim(`(looks like "${r.typosquatOf}")`)}`);
     }
     console.log('');
   }
@@ -303,6 +322,24 @@ export function printAudit(lock: LockfileData): void {
     console.log(chalk.green('  All packages are clean — no sensitive capabilities detected.'));
     console.log('');
   }
+
+  const withLifecycleScripts = entries.filter(([, p]) => (p.lifecycleScripts?.length ?? 0) > 0);
+  if (withLifecycleScripts.length > 0) {
+    console.log(chalk.yellow.bold(`  LIFE-CYCLE SCRIPTS (install-time, not sandboxed)`));
+    for (const [key, p] of withLifecycleScripts) {
+      console.log(`    ${chalk.yellow(`[SCRIPTS] ${(p.lifecycleScripts ?? []).join(', ').padEnd(24)}`)}  ${key}`);
+    }
+    console.log('');
+  }
+
+  const possibleTyposquats = entries.filter(([, p]) => p.typosquatOf);
+  if (possibleTyposquats.length > 0) {
+    console.log(chalk.red.bold(`  POSSIBLE TYPOSQUATS`));
+    for (const [key, p] of possibleTyposquats) {
+      console.log(`    ${chalk.red(`[TYPOSQUAT] looks like "${p.typosquatOf}"`.padEnd(40))}  ${key}`);
+    }
+    console.log('');
+  }
 }
 
 // ─── Progress bar ────────────────────────────────────────────────────────────
@@ -443,6 +480,34 @@ export function generateMarkdownReport(lock: LockfileData): string {
     lines.push('');
   }
 
+  const possibleTyposquats = entries.filter(([, p]) => p.typosquatOf);
+  if (possibleTyposquats.length > 0) {
+    lines.push('## Possible Typosquats');
+    lines.push('');
+    lines.push('Package name is one character away from a popular package — verify these are intentional.');
+    lines.push('');
+    lines.push('| Package | Looks Like |');
+    lines.push('|---|---|');
+    for (const [key, p] of possibleTyposquats) {
+      lines.push(`| ${key} | ${p.typosquatOf} |`);
+    }
+    lines.push('');
+  }
+
+  const withLifecycleScripts = entries.filter(([, p]) => (p.lifecycleScripts?.length ?? 0) > 0);
+  if (withLifecycleScripts.length > 0) {
+    lines.push('## Packages With Install-Time Life-Cycle Scripts');
+    lines.push('');
+    lines.push('Not covered by load-time sandboxing — informational only.');
+    lines.push('');
+    lines.push('| Package | Scripts |');
+    lines.push('|---|---|');
+    for (const [key, p] of withLifecycleScripts) {
+      lines.push(`| ${key} | ${(p.lifecycleScripts ?? []).join(', ')} |`);
+    }
+    lines.push('');
+  }
+
   lines.push('## Capability Breakdown');
   lines.push('');
   lines.push('| Capability | Package Count |');
@@ -530,7 +595,7 @@ export function generateSarifReport(violations: string[]): object {
       tool: {
         driver: {
           name: 'warden',
-          version: '0.1.2',
+          version: VERSION,
           informationUri: 'https://github.com/r-seize/warden-sandbox',
           rules: [
             { id: 'WARDEN001', name: 'ContentHashChanged', shortDescription: { text: 'Package content changed since last approval' } },

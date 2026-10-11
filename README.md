@@ -25,11 +25,13 @@ Warden addresses a class of supply-chain attacks where malicious code executes *
   - [warden audit](#warden-audit)
   - [warden report](#warden-report)
   - [warden explain](#warden-explain)
+  - [warden inspect-script](#warden-inspect-script)
   - [warden graph](#warden-graph)
   - [warden install](#warden-install)
   - [warden update](#warden-update)
   - [warden watch](#warden-watch)
   - [warden integrity](#warden-integrity)
+  - [warden ci](#warden-ci)
   - [warden config init](#warden-config-init)
   - [warden config recommend](#warden-config-recommend)
 - [Configuration file](#configuration-file-wardenrcjson)
@@ -70,12 +72,19 @@ warden approve <pkg> # approve each changed package individually
 warden verify        # CI gate — exits non-zero on any deviation
 ```
 
+In CI, `warden ci` bundles `integrity` + `verify` + `audit` into a single gate:
+
+```bash
+warden ci   # one exit code instead of chaining three commands
+```
+
 To investigate a specific package:
 
 ```bash
-warden explain axios          # show which files/lines triggered each capability
-warden graph                  # visualise the full dependency tree with capabilities
-warden audit                  # risk breakdown across all packages
+warden explain axios              # show which files/lines triggered each capability
+warden inspect-script axios postinstall   # sandbox-run (or review) its install-time script
+warden graph                      # visualise the full dependency tree with capabilities
+warden audit                      # risk breakdown across all packages
 ```
 
 To run a script under observation or enforcement:
@@ -92,6 +101,12 @@ warden run --enforce script.js   # blocks violations at runtime
 Scans `node_modules` using static AST analysis and generates or updates `warden.lock.json`. Each package's JS files are parsed to detect which Node.js built-in modules are imported, and the results are grouped into capability categories.
 
 Packages already present in the lockfile with a matching SHA-256 content hash are skipped — the scan is incremental and fast on subsequent runs.
+
+Packages linked via symlink (pnpm's `node_modules`, and npm/yarn workspaces) are resolved and scanned like any other package. In a monorepo, `warden scan` also scans the `node_modules` of every workspace package declared in `package.json` (`workspaces`) or `pnpm-workspace.yaml` (`packages:`), merging the results with the root scan — no extra flag needed. Only simple glob patterns (e.g. `"packages/*"`) are supported.
+
+Packages that declare an npm life-cycle script (`preinstall`, `install`, or `postinstall`) are flagged separately in the scan summary and in `warden audit`/`warden report`. These scripts run at install time, before Warden's hooks exist, so they are **not** sandboxed — the flag is informational, so you know to review them manually, or run `warden inspect-script` against them.
+
+Package names are also checked against a small, offline list of popular packages for likely typosquats (e.g. `lodahs` vs `lodash`) — a one-character match downgrades an otherwise-clean package back to `pending-review` and flags it in the scan summary, `warden audit`, and `warden report`. This is a static, curated list (not a live registry lookup), so it only catches typos of the packages it knows about.
 
 ```
 warden scan [--dir <path>] [--no-progress] [--verbose] [--json]
@@ -122,7 +137,7 @@ Packages with detected capabilities:
 
 ### `warden diff`
 
-Compares the current state of `node_modules` against the committed lockfile and reports any capability changes. Run this after `npm update` to understand the security impact before approving anything.
+Compares the current state of `node_modules` against the committed lockfile and reports any capability changes. Run this after `npm update` to understand the security impact before approving anything. In a monorepo, every workspace package's `node_modules` is scanned too (see [warden scan](#warden-scan)).
 
 ```
 warden diff [--dir <path>] [--from <lockfile>] [--to <lockfile>] [--since <date>] [-v]
@@ -156,7 +171,7 @@ Warden Diff
 
 ### `warden verify`
 
-Compares the current state of `node_modules` against the committed lockfile. Exits `1` if any package has a changed content hash, new capabilities, or a `pending-review` status. Packages listed under `ignore` in `.wardenrc.json` are skipped.
+Compares the current state of `node_modules` against the committed lockfile. Exits `1` if any package has a changed content hash, new capabilities, or a `pending-review` status. Packages listed under `ignore` in `.wardenrc.json` are skipped. In a monorepo, every workspace package's `node_modules` is scanned too (see [warden scan](#warden-scan)).
 
 ```
 warden verify [--dir <path>] [--json] [--sarif] [--junit]
@@ -382,6 +397,50 @@ Warden Explain: axios@1.6.0
       process.env.npm_package_version
 ```
 
+### `warden inspect-script`
+
+Reviews a package's npm life-cycle scripts (`preinstall`/`install`/`postinstall`) before you approve it. These scripts run at install time, before Warden's hooks exist, so they are never sandboxed automatically — this command closes part of that gap for the common case: when the script is a direct `node <file>.js` invocation, Warden runs that file through the same observation/enforcement hooks as `warden run`, scoped to the package's own lockfile policy. Anything else (shell pipelines, `node-gyp`, prebuilt binary installers, `npm-run-all`, ...) runs outside Node's module system — Warden cannot see into it, so it prints the raw command for manual review instead of guessing or running it unsandboxed.
+
+```
+warden inspect-script <pkg> [script] [--dir <path>] [--enforce] [--profile <profile>] [--timeout <ms>]
+```
+
+| Flag | Description |
+|---|---|
+| `<pkg>` | Package name (`axios`) or scoped name (`@scope/pkg`) |
+| `[script]` | One of `preinstall`/`install`/`postinstall`. Omit to inspect every life-cycle script the package declares. |
+| `--dir <path>` | Project directory (default: cwd) |
+| `--enforce` | Block capability violations instead of just logging them (same semantics as `warden run --enforce`) |
+| `--profile <profile>` | `strict`, `default`, or `lenient` |
+| `--timeout <ms>` | Kill the script if it runs longer than N milliseconds |
+
+```bash
+warden inspect-script axios postinstall
+warden inspect-script some-pkg postinstall --enforce
+warden inspect-script some-pkg   # inspects every declared life-cycle script
+```
+
+**Example output (sandboxable):**
+
+```
+Warden Inspect: some-pkg — postinstall
+  Command: node setup.js
+
+[Warden] observation mode — violations will be logged
+
+[Warden] 1 violation(s) recorded:
+  - some-pkg → http (network)
+```
+
+**Example output (not sandboxable):**
+
+```
+Warden Inspect: some-pkg — preinstall
+  Command: node-gyp rebuild
+  Cannot be sandboxed automatically — not a direct `node <file>.js` invocation.
+  Review the command above manually before approving this package.
+```
+
 ### `warden graph`
 
 Visualises the dependency tree with capability annotations. Shows which packages bring in high-risk capabilities (network, spawn, eval, native) transitively.
@@ -415,7 +474,7 @@ Packages with high-risk capabilities (`[NETWORK]`, `[SPAWN]`, `[EVAL]`, `[NATIVE
 
 ### `warden install`
 
-Wraps your package manager's `install` command, then automatically rescans `node_modules` and reports packages needing review. All unknown flags are forwarded to the package manager. Warden auto-detects which package manager to use: if `pnpm-lock.yaml` is present it uses `pnpm`, if `yarn.lock` is present it uses `yarn`, otherwise it uses `npm`.
+Wraps your package manager's `install` command, then automatically rescans `node_modules` (including workspace packages, see [warden scan](#warden-scan)) and reports packages needing review. All unknown flags are forwarded to the package manager. Warden auto-detects which package manager to use: if `pnpm-lock.yaml` is present it uses `pnpm`, if `yarn.lock` is present it uses `yarn`, otherwise it uses `npm`.
 
 ```
 warden install [packages...] [--approve-all] [--dir <path>] [...pm flags]
@@ -436,7 +495,7 @@ warden install some-package --legacy-peer-deps
 
 ### `warden update`
 
-Wraps your package manager's `update` command, then rescans and reports packages whose capabilities changed. Uses the same auto-detection as `warden install` (pnpm, yarn, or npm).
+Wraps your package manager's `update` command, then rescans (including workspace packages, see [warden scan](#warden-scan)) and reports packages whose capabilities changed. Uses the same auto-detection as `warden install` (pnpm, yarn, or npm).
 
 ```
 warden update [packages...] [--approve-all] [--dir <path>] [...pm flags]
@@ -458,7 +517,7 @@ After update, Warden lists every package whose capabilities changed. Without `--
 
 ### `warden watch`
 
-Watches `node_modules` for filesystem changes and automatically rescans when dependencies change. Reports a capability diff after each change and warns if new capabilities are detected.
+Watches `node_modules` for filesystem changes and automatically rescans when dependencies change. In a monorepo, every workspace package's `node_modules` is watched too (see [warden scan](#warden-scan)). Reports a capability diff after each change and warns if new capabilities are detected.
 
 ```
 warden watch [--dir <path>]
@@ -477,7 +536,9 @@ Changes are debounced by 1 second to avoid thrashing during multi-file installs.
 
 ### `warden integrity`
 
-Reads `package-lock.json` and checks that all packages were installed from the npm registry and have a valid integrity hash. Catches packages installed from git refs, local paths, or private URLs that bypass the registry.
+Reads `package-lock.json` and checks that all packages were installed from a trusted registry and have a valid integrity hash. Catches packages installed from git refs, local paths, or private URLs that bypass the registry.
+
+Trusts `registry.npmjs.org` and `registry.yarnpkg.com` by default. Add your own private registry (Verdaccio, Artifactory, GitHub Packages, ...) via the `registries` field in `.wardenrc.json` — otherwise every package resolved from it is reported as a non-registry source.
 
 ```
 warden integrity [--dir <path>] [--json]
@@ -488,7 +549,7 @@ warden integrity [--dir <path>] [--json]
 | `--dir <path>` | Project directory (default: cwd) |
 | `--json` | Output `{ "checked": number, "issues": [{ package, issue }] }` |
 
-Exit codes: `0` = all clear, `2` = issues found.
+Exit codes: `0` = all clear, `1` = issues found.
 
 ```bash
 warden integrity
@@ -508,6 +569,44 @@ Warden Integrity Check
 
   - patched-lib@1.0.0
     missing integrity hash — package may have been installed from a local path or git ref
+```
+
+### `warden ci`
+
+Runs `warden integrity`, `warden verify`, and `warden audit` together as a single CI gate, with one exit code — instead of chaining three separate commands in your pipeline. `integrity` is skipped (not failed) when there is no `package-lock.json`, since it doesn't yet understand pnpm/yarn lockfiles; `audit` is informational only and never fails the gate on its own, it just surfaces the high-risk package count alongside the pass/fail result.
+
+```
+warden ci [--dir <path>] [--json]
+```
+
+| Flag | Description |
+|---|---|
+| `--dir <path>` | Project directory (default: cwd) |
+| `--json` | Output `{ ok, integrity, verify, audit }` |
+
+Exit codes: `0` = integrity and verify both passed (or integrity was skipped), `1` = either failed.
+
+```yaml
+# GitHub Actions — replaces separate integrity/verify/sarif/junit steps for a simple gate
+- run: warden ci
+```
+
+```bash
+warden ci
+warden ci --json
+```
+
+**Example output:**
+
+```
+Warden CI
+
+  + integrity   ok (67 package(s) checked)
+  x verify      1 violation(s)
+      - some-lib@3.1.0: new capabilities detected: network
+  i audit       67 package(s) scanned, 2 high-risk
+
+  CI gate failed.
 ```
 
 ### `warden config init`
@@ -566,7 +665,8 @@ A `.wardenrc.json` file at the project root provides defaults for CLI flags. CLI
 {
   "profile": "strict",
   "autoApprove": false,
-  "ignore": ["my-trusted-internal-package"]
+  "ignore": ["my-trusted-internal-package"],
+  "registries": ["https://npm.mycompany.internal/"]
 }
 ```
 
@@ -575,6 +675,7 @@ A `.wardenrc.json` file at the project root provides defaults for CLI flags. CLI
 | `profile` | `"strict" \| "default" \| "lenient"` | Default profile for `warden run` |
 | `autoApprove` | `boolean` | Equivalent to passing `--approve-all` to `warden install` / `warden update` |
 | `ignore` | `string[]` | Package names excluded from `warden verify` violations (still scanned and in lockfile) |
+| `registries` | `string[]` | Extra registry URL prefixes trusted by `warden integrity`, beyond the npm/yarn public registries |
 
 Create it interactively with `warden config init`, or write it manually.
 
@@ -621,6 +722,8 @@ Create it interactively with `warden config init`, or write it manually.
 | `deniedCapabilities` | `string[]?` | Set by `--deny`. The runtime removes these from the effective capability set. |
 | `status` | `string` | `approved`, `pending-review`, `unsandboxed`, or `unanalyzable` |
 | `note` | `string?` | Human-readable note (auto-generated on capability changes, or set with `--note`). |
+| `lifecycleScripts` | `string[]?` | npm life-cycle scripts (`preinstall`/`install`/`postinstall`) the package declares. Install-time only — not covered by runtime sandboxing. |
+| `typosquatOf` | `string?` | Set when the package name is a likely one-character typo of a popular package. |
 
 ## Capabilities
 
@@ -684,11 +787,19 @@ These are design constraints, not bugs.
 
 ### Static analysis has blind spots
 
-The AST scanner cannot detect capabilities hidden behind runtime `eval`, dynamic `require(variable)`, or obfuscated code. When these patterns appear, Warden flags the package as `dynamic-code` / `pending-review`. **`approved` status is not a security proof** — it means declared capabilities were reviewed by a human.
+The AST scanner cannot detect capabilities hidden behind runtime `eval`, a genuinely dynamic `require(someFunctionCall())`, or obfuscated code. It does resolve `require()`/`import()` when the specifier is statically known — a literal, a no-interpolation template literal, a `const` bound to one of those, or a `+` concatenation of them (e.g. `const MOD = 'child_' + 'process'; require(MOD)`) — but anything resolved only at runtime (a reassignable variable, a function result, string interpolation) still falls through to the existing fallback. When these patterns appear, Warden flags the package as `dynamic-code` / `pending-review`. **`approved` status is not a security proof** — it means declared capabilities were reviewed by a human.
 
 ### Native addons cannot be sandboxed
 
 A `.node` addon is a compiled binary loaded directly into the process. Warden detects these and marks them `unsandboxed`, but cannot restrict them at runtime.
+
+### Install-time scripts are not sandboxed
+
+Warden's hooks only exist once a script `require`s/`import`s a package — they cannot intercept `preinstall`/`install`/`postinstall` scripts, which run earlier, during `npm install`. `warden scan` detects and flags packages that declare these scripts (visible in the scan summary, `warden audit`, and `warden report`) so you know to review them manually. `warden inspect-script` can sandbox-run the common case — a script that is a direct `node <file>.js` invocation — but anything else (shell pipelines, `node-gyp`, prebuilt binary installers) is still outside Warden's reach and is only ever shown for manual review, never executed by Warden.
+
+### The typosquat list is small, static, and offline
+
+`warden scan` flags package names that are a one-character edit away from a name in a small, bundled list of popular packages. It is not a registry lookup and does not grow over time on its own — it only catches typos of the packages already in that list, and it intentionally ignores scoped packages (`@scope/name`) and anything more than one character off, to keep false positives low.
 
 ### Observation mode never blocks
 

@@ -92,6 +92,27 @@ export function analyzeSource(source: string, collectEvidence = false): Analysis
     return result;
   }
 
+  // ── Pass 0 : collect const string bindings ─────────────────────────────────
+  // Lets require(MOD_NAME) resolve when MOD_NAME is a `const` bound to a literal
+  // string, a no-interpolation template literal, or a '+' concatenation of such
+  // values — e.g. `const MOD = 'child_' + 'process'; require(MOD);`. Conservative
+  // on purpose: only `const` bindings are trusted (can't be reassigned), and only
+  // sources earlier in the walk order are visible, so forward references don't
+  // resolve. Anything else still falls through to the existing dynamic-require
+  // handling unchanged.
+  const constStrings = new Map<string, string>();
+  walk.simple(ast as unknown as acorn.Node, {
+    VariableDeclaration(rawNode) {
+      const node = rawNode as unknown as { kind: string; declarations: VarDeclNode[] };
+      if (node.kind !== 'const') return;
+      for (const decl of node.declarations) {
+        if (decl.id.type !== 'Identifier' || !decl.init) continue;
+        const value = evaluateStaticString(decl.init as unknown as AstNode, constStrings);
+        if (value !== null) constStrings.set((decl.id as unknown as IdentifierNode).name, value);
+      }
+    },
+  });
+
   // ── Pass 1 : collect module bindings ──────────────────────────────────────
   // varName → module specifier  (const fs = require('fs') / import fs from 'fs')
   const varToModule = new Map<string, string>();
@@ -123,7 +144,7 @@ export function analyzeSource(source: string, collectEvidence = false): Analysis
     VariableDeclarator(rawNode) {
       const node = rawNode as unknown as VarDeclNode;
       if (!node.init) return;
-      const modName = extractRequiredModule(node.init as unknown as AstNode);
+      const modName = extractRequiredModule(node.init as unknown as AstNode, constStrings);
       if (!modName) return;
 
       if (node.id.type === 'Identifier') {
@@ -147,7 +168,7 @@ export function analyzeSource(source: string, collectEvidence = false): Analysis
     // ── CJS: x = require('mod') ────────────────────────────────────────────
     AssignmentExpression(rawNode) {
       const node       = rawNode as unknown as AssignExprNode;
-      const modName    = extractRequiredModule(node.right as unknown as AstNode);
+      const modName    = extractRequiredModule(node.right as unknown as AstNode, constStrings);
       if (!modName) return;
       if (node.left.type === 'Identifier') {
         const name = (node.left as unknown as IdentifierNode).name;
@@ -205,10 +226,10 @@ export function analyzeSource(source: string, collectEvidence = false): Analysis
 
     // ── Dynamic import: import('mod') ──────────────────────────────────────
     ImportExpression(rawNode) {
-      const node    = rawNode as unknown as ImportExprNode;
-      const src     = node.source as unknown as AstNode;
-      if (src.type !== 'Literal') return; // dynamic string → unanalyzable, skip
-      const modName = (src as unknown as LiteralNode).value as string;
+      const node       = rawNode as unknown as ImportExprNode;
+      const src        = node.source as unknown as AstNode;
+      const modName    = evaluateStaticString(src, constStrings);
+      if (!modName) return; // genuinely dynamic specifier — skip
       if (FS_MODULE_NAMES.has(modName)) {
         fsRequired = true;
       } else if (SENSITIVE_MODULES[modName]) {
@@ -223,7 +244,7 @@ export function analyzeSource(source: string, collectEvidence = false): Analysis
 
       // Inline require — already handled in pass 1 for bindings, but may appear
       // as an expression not assigned to anything: require('net')
-      const inlineMod = extractRequiredModule(rawNode as unknown as AstNode);
+      const inlineMod = extractRequiredModule(rawNode as unknown as AstNode, constStrings);
       if (inlineMod) {
         if (FS_MODULE_NAMES.has(inlineMod)) {
           fsRequired = true;
@@ -244,7 +265,7 @@ export function analyzeSource(source: string, collectEvidence = false): Analysis
         const obj           = mem.object as unknown as AstNode;
 
         // require('fs').readFile(...)
-        const objMod = extractRequiredModule(obj);
+        const objMod = extractRequiredModule(obj, constStrings);
         if (objMod && FS_MODULE_NAMES.has(objMod) && methodName) {
           fsRequired = true;
           trackFsMethod(methodName, fsMethods, addCapability, node.start, node.end);
@@ -346,7 +367,7 @@ export function analyzeSource(source: string, collectEvidence = false): Analysis
     // If no specific method call was found but fs was imported, emit a generic
     // filesystem-read evidence at the require/import site (evidence-only path).
     if (collectEvidence && !result.evidence.some(e => e.capability === 'filesystem-read')) {
-      emitFsRequireEvidence(ast, result.evidence);
+      emitFsRequireEvidence(ast, result.evidence, constStrings);
     }
   }
 
@@ -370,7 +391,7 @@ function parseAST(source: string): acorn.Program | null {
   }
 }
 
-function extractRequiredModule(node: AstNode): string | null {
+function extractRequiredModule(node: AstNode, constStrings: Map<string, string>): string | null {
   if (node.type !== 'CallExpression') return null;
   const call      = node as unknown as CallExprNode;
   const callee    = call.callee as unknown as AstNode;
@@ -381,9 +402,42 @@ function extractRequiredModule(node: AstNode): string | null {
       ((callee as unknown as MemberExprNode).property as unknown as IdentifierNode).name === 'require');
   if (!isRequire || call.arguments.length === 0) return null;
   const firstArg = call.arguments[0] as unknown as AstNode;
-  if (firstArg.type !== 'Literal') return null;
-  const val = (firstArg as unknown as LiteralNode).value;
-  return typeof val === 'string' ? val : null;
+  return evaluateStaticString(firstArg, constStrings);
+}
+
+/**
+ * Resolve a module-specifier expression to a concrete string when it is
+ * statically known: a literal, a no-interpolation template literal, a
+ * reference to a `const` bound to one of these (see the pass-0 walk above),
+ * or a '+' concatenation of such values. Returns null for anything else
+ * (a variable require(), a function call, string interpolation, etc.) —
+ * those remain genuinely dynamic and are left for the existing fallback
+ * (heuristic scan / unanalyzable marking) to handle.
+ */
+function evaluateStaticString(node: AstNode, constStrings: Map<string, string>): string | null {
+  switch (node.type) {
+    case 'Literal': {
+      const val = (node as unknown as LiteralNode).value;
+      return typeof val === 'string' ? val : null;
+    }
+    case 'TemplateLiteral': {
+      const tpl = node as unknown as { expressions: AstNode[]; quasis: Array<{ value: { cooked: string | null } }> };
+      if (tpl.expressions.length > 0) return null; // has interpolation — not statically known
+      return tpl.quasis[0]?.value.cooked ?? null;
+    }
+    case 'Identifier': {
+      return constStrings.get((node as unknown as IdentifierNode).name) ?? null;
+    }
+    case 'BinaryExpression': {
+      const bin = node as unknown as { operator: string; left: AstNode; right: AstNode };
+      if (bin.operator !== '+') return null;
+      const left     = evaluateStaticString(bin.left, constStrings);
+      const right    = evaluateStaticString(bin.right, constStrings);
+      return left !== null && right !== null ? left + right : null;
+    }
+    default:
+      return null;
+  }
 }
 
 function getMemberProp(node: MemberExprNode): string | null {
@@ -404,11 +458,11 @@ function trackFsMethod(
   addCapability(cap, start, end);
 }
 
-function emitFsRequireEvidence(ast: acorn.Program, evidence: RawEvidence[]): void {
+function emitFsRequireEvidence(ast: acorn.Program, evidence: RawEvidence[], constStrings: Map<string, string>): void {
   walk.simple(ast as unknown as acorn.Node, {
     CallExpression(rawNode) {
       const node    = rawNode as unknown as CallExprNode;
-      const mod     = extractRequiredModule(rawNode as unknown as AstNode);
+      const mod     = extractRequiredModule(rawNode as unknown as AstNode, constStrings);
       if (mod && FS_MODULE_NAMES.has(mod)) {
         evidence.push({ capability: 'filesystem-read', start: node.start, end: node.end });
       }
@@ -420,9 +474,10 @@ function emitFsRequireEvidence(ast: acorn.Program, evidence: RawEvidence[]): voi
       }
     },
     ImportExpression(rawNode) {
-      const node    = rawNode as unknown as ImportExprNode;
-      const src     = node.source as unknown as AstNode;
-      if (src.type === 'Literal' && FS_MODULE_NAMES.has((src as unknown as LiteralNode).value as string)) {
+      const node       = rawNode as unknown as ImportExprNode;
+      const src        = node.source as unknown as AstNode;
+      const modName    = evaluateStaticString(src, constStrings);
+      if (modName && FS_MODULE_NAMES.has(modName)) {
         evidence.push({ capability: 'filesystem-read', start: node.start, end: node.end });
       }
     },

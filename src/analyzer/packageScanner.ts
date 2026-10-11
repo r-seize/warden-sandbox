@@ -3,7 +3,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { Capability } from './capabilityMap';
 import { scanFile, scanFileHeuristic } from './astScanner';
-import { collectJsFiles, hasNativeAddon } from './fileUtils';
+import { collectJsFiles, hasNativeAddon, isDirEntry } from './fileUtils';
+import { detectTyposquat } from './typosquat';
 import type { WorkerInput, WorkerMessage } from './scanWorker';
 
 export interface PackageScanResult {
@@ -15,6 +16,11 @@ export interface PackageScanResult {
   hasNativeBindings: boolean;
   unanalyzableFiles: string[];
   fileCount: number;
+  /** npm life-cycle script names ('preinstall' | 'install' | 'postinstall') the package declares.
+   *  These run at install time, outside Warden's load-time sandboxing — surfaced for visibility only. */
+  lifecycleScripts: string[];
+  /** Set when the package name is a likely one-character typo of a popular package (see typosquat.ts). */
+  typosquatOf: string | null;
 }
 
 export interface ScanCacheEntry {
@@ -46,14 +52,28 @@ function hashDir(jsFiles: string[]): string {
   return 'sha256:' + hasher.digest('hex');
 }
 
+interface PackageJsonMeta {
+  name?: string;
+  version?: string;
+  scripts?: Record<string, string>;
+}
+
 /** Read name + version from a package's package.json, returning empty object on failure. */
-export function readPackageJson(pkgDir: string): { name?: string; version?: string } {
+export function readPackageJson(pkgDir: string): PackageJsonMeta {
   try {
     const raw = fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8');
-    return JSON.parse(raw) as { name?: string; version?: string };
+    return JSON.parse(raw) as PackageJsonMeta;
   } catch {
     return {};
   }
+}
+
+const LIFECYCLE_SCRIPT_NAMES = ['preinstall', 'install', 'postinstall'];
+
+/** Names of npm life-cycle install scripts ('preinstall'/'install'/'postinstall') the package declares. */
+function detectLifecycleScripts(pkgJson: PackageJsonMeta): string[] {
+  const scripts = pkgJson.scripts ?? {};
+  return LIFECYCLE_SCRIPT_NAMES.filter(name => typeof scripts[name] === 'string' && scripts[name].trim().length > 0);
 }
 
 /**
@@ -68,8 +88,10 @@ export function scanPackage(
   const name       = pkgJson.name ?? path.basename(pkgDir);
   const version    = pkgJson.version ?? 'unknown';
 
-  const jsFiles        = collectJsFiles(pkgDir);
-  const contentHash    = hashDir(jsFiles);
+  const jsFiles             = collectJsFiles(pkgDir);
+  const contentHash         = hashDir(jsFiles);
+  const lifecycleScripts    = detectLifecycleScripts(pkgJson);
+  const typosquatOf         = detectTyposquat(name);
 
   if (cachedEntry && cachedEntry.contentHash === contentHash) {
     return cachedEntry.result;
@@ -86,6 +108,8 @@ export function scanPackage(
       hasNativeBindings: true,
       unanalyzableFiles: [],
       fileCount: jsFiles.length,
+      lifecycleScripts,
+      typosquatOf,
     };
   }
 
@@ -130,6 +154,8 @@ export function scanPackage(
     hasNativeBindings: false,
     unanalyzableFiles,
     fileCount: jsFiles.length,
+    lifecycleScripts,
+    typosquatOf,
   };
 }
 
@@ -296,7 +322,43 @@ export async function scanNodeModules(
   return results.filter(Boolean);
 }
 
-/** Enumerate all top-level (and scoped) package directories inside node_modules. */
+/**
+ * Scan a whole project: the root node_modules plus any workspace packages'
+ * own node_modules (npm/yarn `workspaces`, or pnpm-workspace.yaml). Results
+ * are merged by `name@version`; a package already seen in an earlier target
+ * is not re-scanned under a later one.
+ */
+export async function scanProject(
+  projectDir: string,
+  cache: Map<string, ScanCacheEntry>,
+  onProgress?: (done: number, total: number, pkgName: string) => void,
+  useGlobalCache = true,
+  onVerbose?: (info: VerboseInfo) => void,
+): Promise<PackageScanResult[]> {
+  const targets = discoverScanTargets(projectDir);
+  if (targets.length <= 1) {
+    const nodeModulesDir = targets[0]?.nodeModulesDir ?? path.join(projectDir, 'node_modules');
+    return scanNodeModules(nodeModulesDir, cache, onProgress, useGlobalCache, onVerbose);
+  }
+
+  const merged    = new Map<string, PackageScanResult>();
+  for (const target of targets) {
+    const results = await scanNodeModules(target.nodeModulesDir, cache, onProgress, useGlobalCache, onVerbose);
+    for (const result of results) {
+      const key = `${result.name}@${result.version}`;
+      if (!merged.has(key)) merged.set(key, result);
+    }
+  }
+  return [...merged.values()];
+}
+
+/**
+ * Enumerate all top-level (and scoped) package directories inside node_modules.
+ *
+ * pnpm (and npm/yarn workspaces) link packages into node_modules via symlinks
+ * rather than real directories, so entries are checked with {@link isDirEntry}
+ * (which resolves symlinks) instead of the raw, symlink-blind `Dirent.isDirectory()`.
+ */
 function discoverPackages(nodeModulesDir: string): string[] {
   const packages: string[] = [];
   let entries: fs.Dirent[];
@@ -306,24 +368,120 @@ function discoverPackages(nodeModulesDir: string): string[] {
     return packages;
   }
   for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
     if (entry.name.startsWith('.')) continue;
+    const fullPath = path.join(nodeModulesDir, entry.name);
+    if (!isDirEntry(fullPath, entry)) continue;
     if (entry.name.startsWith('@')) {
-      const scopedDir = path.join(nodeModulesDir, entry.name);
       let scoped: fs.Dirent[];
       try {
-        scoped = fs.readdirSync(scopedDir, { withFileTypes: true });
+        scoped = fs.readdirSync(fullPath, { withFileTypes: true });
       } catch {
         continue;
       }
       for (const s of scoped) {
-        if (s.isDirectory()) {
-          packages.push(path.join(scopedDir, s.name));
+        const scopedPath = path.join(fullPath, s.name);
+        if (isDirEntry(scopedPath, s)) {
+          packages.push(scopedPath);
         }
       }
     } else {
-      packages.push(path.join(nodeModulesDir, entry.name));
+      packages.push(fullPath);
     }
   }
   return packages;
+}
+
+// ─── Workspace / monorepo discovery ──────────────────────────────────────────
+
+export interface ScanTarget {
+  /** Directory the node_modules belongs to (project root, or a workspace package). */
+  dir: string;
+  nodeModulesDir: string;
+}
+
+interface RootPackageJson {
+  workspaces?: string[] | { packages?: string[] };
+}
+
+/** Read workspace glob patterns from package.json ("workspaces") and pnpm-workspace.yaml. */
+function readWorkspacePatterns(projectDir: string): string[] {
+  const patterns: string[] = [];
+
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf8')) as RootPackageJson;
+    if (Array.isArray(pkg.workspaces)) {
+      patterns.push(...pkg.workspaces);
+    } else if (pkg.workspaces?.packages) {
+      patterns.push(...pkg.workspaces.packages);
+    }
+  } catch { /* no package.json, or no workspaces field */ }
+
+  try {
+    const raw     = fs.readFileSync(path.join(projectDir, 'pnpm-workspace.yaml'), 'utf8');
+    const lines   = raw.split('\n');
+    let inList    = false;
+    for (const line of lines) {
+      if (/^\s*packages\s*:/.test(line)) { inList = true; continue; }
+      if (inList) {
+        const item = line.match(/^\s*-\s*['"]?([^'"]+)['"]?\s*$/);
+        if (item) { patterns.push(item[1]); continue; }
+        if (line.trim().length > 0 && !line.startsWith(' ') && !line.startsWith('-')) break;
+      }
+    }
+  } catch { /* no pnpm-workspace.yaml */ }
+
+  return patterns;
+}
+
+/**
+ * Expand a single workspace glob pattern into directories.
+ * Supports literal paths ("apps/api") and a single trailing wildcard segment
+ * ("packages/*"). Other glob syntax (nested wildcards, "!" exclusions) is not
+ * supported and is skipped rather than mis-resolved.
+ */
+function expandWorkspacePattern(projectDir: string, pattern: string): string[] {
+  const normalized = pattern.replace(/\/+$/, '');
+
+  if (normalized.endsWith('/*')) {
+    const baseDir = path.join(projectDir, normalized.slice(0, -2));
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(baseDir, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    return entries
+      .filter(e => !e.name.startsWith('.') && isDirEntry(path.join(baseDir, e.name), e))
+      .map(e => path.join(baseDir, e.name));
+  }
+
+  if (normalized.includes('*')) return []; // unsupported glob shape — skip
+
+  const dir = path.join(projectDir, normalized);
+  return fs.existsSync(dir) ? [dir] : [];
+}
+
+/** Discover every node_modules directory relevant to a project: the root, plus any workspace packages. */
+export function discoverScanTargets(projectDir: string): ScanTarget[] {
+  const targets: ScanTarget[]    = [];
+  const seen                     = new Set<string>();
+
+  const add = (dir: string) => {
+    const nodeModulesDir = path.join(dir, 'node_modules');
+    if (seen.has(nodeModulesDir)) return;
+    if (!fs.existsSync(nodeModulesDir)) return;
+    seen.add(nodeModulesDir);
+    targets.push({ dir, nodeModulesDir });
+  };
+
+  add(projectDir);
+
+  const patterns = readWorkspacePatterns(projectDir);
+  for (const pattern of patterns) {
+    for (const wsDir of expandWorkspacePattern(projectDir, pattern)) {
+      add(wsDir);
+    }
+  }
+
+  return targets;
 }

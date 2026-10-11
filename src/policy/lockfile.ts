@@ -16,6 +16,11 @@ export interface PackagePolicy {
   deniedCapabilities?: Capability[];
   status: PackageStatus;
   note?: string;
+  /** npm life-cycle scripts ('preinstall'/'install'/'postinstall') this package declares.
+   *  Informational only — these run at install time, before Warden's load-time hooks exist. */
+  lifecycleScripts?: string[];
+  /** Set when the package name is a likely one-character typo of a popular package. */
+  typosquatOf?: string;
 }
 
 export interface LockfileData {

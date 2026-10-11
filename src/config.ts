@@ -10,6 +10,9 @@ export interface WardenConfig {
   ignore?: string[];
   /** Auto-approve all new packages after `warden install` / `warden update`. */
   autoApprove?: boolean;
+  /** Extra registry URL prefixes trusted by `warden integrity`, in addition to the
+   *  npm and yarn public registries (e.g. a private registry like Verdaccio or Artifactory). */
+  registries?: string[];
 }
 
 export function readConfig(projectDir: string): WardenConfig {

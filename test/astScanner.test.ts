@@ -267,3 +267,63 @@ describe('combined capabilities in one file', () => {
     expect(result).toContain('dynamic-code');
   });
 });
+
+// ─── static resolution of dynamic require() ──────────────────────────────────
+
+describe('static resolution of simple dynamic require()', () => {
+  it('resolves require(CONST) when CONST is a const string literal', () => {
+    const result = caps(`
+      const MOD = 'child_process';
+      const cp = require(MOD);
+      cp.exec('ls');
+    `);
+    expect(result).toContain('process-spawn');
+  });
+
+  it('resolves require() of a no-interpolation template literal', () => {
+    const result = caps('const net = require(`net`); net.connect();');
+    expect(result).toContain('network');
+  });
+
+  it('resolves require() of a string concatenation', () => {
+    const result = caps(`const http = require('ht' + 'tp'); http.request();`);
+    expect(result).toContain('network');
+  });
+
+  it('resolves require() of a concatenation of two consts', () => {
+    const result = caps(`
+      const A = 'chi';
+      const B = 'ld_process';
+      const cp = require(A + B);
+      cp.spawn('ls');
+    `);
+    expect(result).toContain('process-spawn');
+  });
+
+  it('does not resolve require() of a reassignable (non-const) variable', () => {
+    const result = caps(`
+      let mod = 'net';
+      mod = getModuleName();
+      const m = require(mod);
+    `);
+    expect(result).not.toContain('network');
+  });
+
+  it('does not resolve a template literal with interpolation', () => {
+    const result = caps('const m = require(`${dynamicName}`);');
+    expect(result).toEqual([]);
+  });
+
+  it('does not resolve require() of a genuinely dynamic expression', () => {
+    const result = caps(`const m = require(getModuleName());`);
+    expect(result).toEqual([]);
+  });
+
+  it('resolves dynamic import() of a const-bound module name', () => {
+    const result = caps(`
+      const MOD = 'fs';
+      import(MOD).then(fs => fs.readFileSync('./x'));
+    `);
+    expect(result).toContain('filesystem-read');
+  });
+});

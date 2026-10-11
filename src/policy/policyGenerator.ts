@@ -29,11 +29,25 @@ export function packageScanResultToPolicy(result: PackageScanResult): PackagePol
     capabilities: result.capabilities,
     status,
   };
+  // `status` may still be downgraded below (e.g. a typosquat match forces re-review).
 
   if (result.hasNativeBindings) {
     policy.note = 'Package contains native .node addon(s). Cannot be sandboxed — runs with full system access.';
   } else if (result.unanalyzableFiles.length > 0) {
     policy.note = `${result.unanalyzableFiles.length} file(s) could not be parsed (may use non-standard syntax or be obfuscated). Capabilities may be incomplete.`;
+  }
+
+  if (result.lifecycleScripts.length > 0) {
+    policy.lifecycleScripts    = result.lifecycleScripts;
+    const scriptNote           = `Declares npm life-cycle script(s): ${result.lifecycleScripts.join(', ')}. These run at install time — not covered by Warden's load-time sandboxing.`;
+    policy.note                = policy.note ? `${policy.note} ${scriptNote}` : scriptNote;
+  }
+
+  if (result.typosquatOf) {
+    policy.typosquatOf    = result.typosquatOf;
+    const squatNote       = `Package name is one character away from popular package "${result.typosquatOf}" — possible typosquat, verify this is the package you intended to install.`;
+    policy.note           = policy.note ? `${policy.note} ${squatNote}` : squatNote;
+    if (policy.status === 'approved') policy.status = 'pending-review';
   }
 
   return policy;

@@ -12,6 +12,22 @@ export const SKIP_DIRS = new Set([
 const JS_EXTENSIONS = new Set(['.js', '.cjs', '.mjs']);
 
 /**
+ * Whether `entry` (located at `fullPath`) should be treated as a directory.
+ * `Dirent.isDirectory()` is false for symlinks — pnpm and npm/yarn workspaces
+ * link packages into node_modules via symlinks, so a plain isDirectory()
+ * check silently skips every linked package. Resolve the link to find out.
+ */
+export function isDirEntry(fullPath: string, entry: fs.Dirent): boolean {
+  if (entry.isDirectory()) return true;
+  if (!entry.isSymbolicLink()) return false;
+  try {
+    return fs.statSync(fullPath).isDirectory();
+  } catch {
+    return false; // broken symlink
+  }
+}
+
+/**
  * Recursively collect all JavaScript files under `dir`, skipping
  * test/doc/coverage directories. Files larger than `maxSize` bytes are
  * included (callers decide how to handle oversized files).
@@ -31,10 +47,11 @@ function _collect(dir: string, out: string[]): void {
   }
   for (const entry of entries) {
     if (entry.name.startsWith('.')) continue;
-    if (entry.isDirectory()) {
-      if (!SKIP_DIRS.has(entry.name)) _collect(path.join(dir, entry.name), out);
+    const fullPath = path.join(dir, entry.name);
+    if (isDirEntry(fullPath, entry)) {
+      if (!SKIP_DIRS.has(entry.name)) _collect(fullPath, out);
     } else if (entry.isFile() && JS_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) {
-      out.push(path.join(dir, entry.name));
+      out.push(fullPath);
     }
   }
 }
@@ -51,8 +68,9 @@ export function hasNativeAddon(dir: string): boolean {
   }
   for (const entry of entries) {
     if (entry.isFile() && entry.name.endsWith('.node')) return true;
-    if (entry.isDirectory() && !SKIP_DIRS.has(entry.name)) {
-      if (hasNativeAddon(path.join(dir, entry.name))) return true;
+    const fullPath = path.join(dir, entry.name);
+    if (isDirEntry(fullPath, entry) && !SKIP_DIRS.has(entry.name)) {
+      if (hasNativeAddon(fullPath)) return true;
     }
   }
   return false;

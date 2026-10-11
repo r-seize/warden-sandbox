@@ -4,10 +4,12 @@ import * as fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { Command } from 'commander';
 import {
-  scanNodeModules,
+  scanProject,
+  discoverScanTargets,
   ScanCacheEntry,
   loadGlobalCache,
 } from './analyzer/packageScanner';
+import { VERSION } from './version';
 import { buildPolicyMap } from './policy/policyGenerator';
 import {
   readLockfile,
@@ -43,7 +45,7 @@ const program = new Command();
 program
   .name('warden')
   .description('Runtime capability sandboxing for Node.js dependencies')
-  .version('0.1.2');
+  .version(VERSION);
 
 // ─── scan ────────────────────────────────────────────────────────────────────
 
@@ -83,8 +85,8 @@ program
         }
       : undefined;
 
-    const results = await scanNodeModules(
-      nodeModulesDir,
+    const results = await scanProject(
+      projectDir,
       cache,
       progressPrinter,
       true,
@@ -174,7 +176,7 @@ program
       }
       const cache = buildCacheFromLockfile(oldLock);
       console.log(chalk.bold('\nWarden — scanning node_modules for diff...'));
-      const results        = await scanNodeModules(nodeModulesDir, cache, (d, t, p) => printProgress(d, t, p));
+      const results        = await scanProject(projectDir, cache, (d, t, p) => printProgress(d, t, p));
       const newPolicies    = buildPolicyMap(results);
       newLock              = mergeLockfile(null, newPolicies);
     }
@@ -209,9 +211,10 @@ program
       process.exit(2);
     }
 
-    const cache = buildCacheFromLockfile(existing);
-    console.log(chalk.bold('\nWarden verify — scanning node_modules...'));
-    const results        = await scanNodeModules(nodeModulesDir, cache, (d, t, p) => printProgress(d, t, p));
+    const cache          = buildCacheFromLockfile(existing);
+    const machineOutput  = opts.json || opts.sarif || opts.junit;
+    if (!machineOutput) console.log(chalk.bold('\nWarden verify — scanning node_modules...'));
+    const results        = await scanProject(projectDir, cache, machineOutput ? undefined : (d, t, p) => printProgress(d, t, p));
     const newPolicies    = buildPolicyMap(results);
 
     const config                  = readConfig(projectDir);
@@ -244,13 +247,7 @@ program
       }
     }
 
-    // Check for packages in lockfile that are gone from node_modules
-    for (const key of Object.keys(existing.packages)) {
-      if (!newPolicies[key]) {
-        // Package removed — not a security violation, just informational
-        // We don't fail verify for removed packages
-      }
-    }
+    // Packages removed from node_modules are not a violation — nothing to check for them.
 
     const ok = violations.length === 0;
 
@@ -356,10 +353,10 @@ program
       const nodeModulesDir = path.join(projectDir, 'node_modules');
       if (fs.existsSync(nodeModulesDir)) {
         console.log(chalk.dim('\n  Re-scanning packages before approving...'));
-        const { scanNodeModules }    = await import('./analyzer/packageScanner') as typeof import('./analyzer/packageScanner');
-        const { buildPolicyMap }     = await import('./policy/policyGenerator') as typeof import('./policy/policyGenerator');
-        const cache                  = buildCacheFromLockfile(lockfile);
-        const results                = await scanNodeModules(nodeModulesDir, cache);
+        const { scanProject: rescanProject }    = await import('./analyzer/packageScanner') as typeof import('./analyzer/packageScanner');
+        const { buildPolicyMap }                = await import('./policy/policyGenerator') as typeof import('./policy/policyGenerator');
+        const cache                              = buildCacheFromLockfile(lockfile);
+        const results                            = await rescanProject(projectDir, cache);
         const fresh                  = buildPolicyMap(results);
         // Update capabilities from fresh scan (but don't overwrite status yet)
         for (const [key, newPol] of Object.entries(fresh)) {
@@ -509,107 +506,144 @@ program
       process.exit(2);
     }
 
-    // Capture native import() before SES's lockdown() can patch Function.
-    // new Function prevents tsc (module: CommonJS) from rewriting import() → require().
-    // Must be created before any require('./runtime/...') calls since loading
-    // moduleLoaderHook triggers ses/lockdown when --enforce is active.
-    const { pathToFileURL }    = require('node:url') as typeof import('node:url');
-    const nativeImport         = new Function('url', 'return import(url)') as (url: string) => Promise<unknown>;
-
-    // Lazy imports: avoid loading ses before this command is chosen
-    // (lockdown() must only be called here, not at module-load time)
-    const { installModuleLoaderHook }    = require('./runtime/moduleLoaderHook') as typeof import('./runtime/moduleLoaderHook');
-    const { installEsmLoaderHook }       = require('./runtime/esmLoaderHook') as typeof import('./runtime/esmLoaderHook');
-    const { createViolationHandler }     = require('./runtime/violationHandler') as typeof import('./runtime/violationHandler');
-
-    const violationLog: Array<{ pkg: string; cap: string; api: string; stack?: string }> = [];
-
-    // --on-violation block maps to 'exit' mode; 'log' and 'prompt' both log for now.
-    // 'prompt' is interactive and only meaningful outside --enforce.
-    const resolvedMode = opts.enforce
-      ? 'throw'
-      : opts.onViolation === 'block'
-      ? 'exit'
-      : 'log';
-
-    const onViolation = createViolationHandler({
-      mode: resolvedMode,
-      jsonLogging: opts.json,
-      captureStack: opts.stack,
-      onViolation: (event) => {
-        violationLog.push({ pkg: event.packageName, cap: event.capability, api: event.apiAccessed, stack: event.stack });
-      },
+    const exitCode = await executeUnderWarden(scriptPath, {
+      lockfile,
+      enforce: opts.enforce,
+      profile,
+      timeoutMs,
+      json: opts.json,
+      onViolationAction: opts.onViolation as 'log' | 'block' | 'prompt',
+      stack: opts.stack,
+      label: `Running ${scriptArg}`,
     });
-
-    // ESM violations arrive via MessagePort from the loader thread — calling them
-    // from an event listener in enforce (throw) mode would produce an uncaught
-    // event-loop exception (caught by SES before our try/catch).
-    // ESM enforcement is handled by the loader thread returning stub modules;
-    // we only need to log violations in the main thread.
-    const esmOnViolation = createViolationHandler({
-      mode: 'log',
-      jsonLogging: opts.json,
-      captureStack: opts.stack,
-      onViolation: (event) => {
-        violationLog.push({ pkg: event.packageName, cap: event.capability, api: event.apiAccessed, stack: event.stack });
-      },
-    });
-
-    const profileLabel    = profile !== 'default' ? chalk.dim(` [${profile}]`) : '';
-    const modeLabel       = opts.enforce
-      ? chalk.yellow.bold('[Warden] enforce mode active — violations will throw') + profileLabel
-      : chalk.cyan.bold('[Warden] observation mode — violations will be logged') + profileLabel;
-    console.log('\n' + modeLabel + '\n');
-
-    // Install CJS hook (Module._load)
-    const uninstallCjs = installModuleLoaderHook(lockfile, opts.enforce, onViolation, profile);
-
-    // Install ESM hook (module.register) — works for import() and ESM scripts
-    const uninstallEsm = installEsmLoaderHook(lockfile, opts.enforce, esmOnViolation, profile);
-
-    // Detect whether the target script is ESM
-    const isEsm = isEsmScript(scriptPath);
-
-    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
-    if (timeoutMs > 0) {
-      timeoutHandle = setTimeout(() => {
-        console.error(chalk.red(`\n[Warden] Timeout: script exceeded ${timeoutMs}ms`));
-        process.exit(1);
-      }, timeoutMs);
-      timeoutHandle.unref();
-    }
-
-    try {
-      if (isEsm) {
-        await nativeImport(pathToFileURL(scriptPath).href);
-      } else {
-        require(scriptPath);
-      }
-    } catch (err) {
-      console.error(chalk.red(`\n[Warden] Script exited with error: ${(err as Error).message}`));
-      process.exitCode = 1;
-    } finally {
-      if (timeoutHandle) clearTimeout(timeoutHandle);
-      uninstallCjs();
-      // Drain pending ESM violation port messages before unregistering listeners.
-      // Port messages from the loader thread are macrotasks — one setImmediate tick
-      // lets the poll phase process them before we remove the listener.
-      if (isEsm) {
-        await new Promise<void>(resolve => setImmediate(resolve));
-      }
-      uninstallEsm();
-      if (violationLog.length > 0) {
-        console.log(chalk.bold(`\n[Warden] ${violationLog.length} violation(s) recorded:`));
-        for (const v of violationLog) {
-          console.log(`  ${chalk.red('-')} ${v.pkg} → ${v.api} (${v.cap})`);
-        }
-      } else {
-        console.log(chalk.green('\n[Warden] No capability violations detected.'));
-      }
-    }
+    process.exitCode = exitCode;
   });
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+interface WardenExecOptions {
+  lockfile: LockfileData;
+  enforce: boolean;
+  profile: import('./runtime/moduleLoaderHook').Profile;
+  timeoutMs: number;
+  json: boolean;
+  onViolationAction: 'log' | 'block' | 'prompt';
+  stack: boolean;
+  /** Printed above the mode banner, e.g. "Running script.js". */
+  label: string;
+}
+
+/**
+ * Install Warden's CJS/ESM module hooks, run `scriptPath` under them, print a
+ * violation summary, and return an exit code. Shared by `warden run` and
+ * `warden inspect-script` — both ultimately just need "execute this one
+ * Node.js entry file under the lockfile's policy" with the same reporting.
+ */
+async function executeUnderWarden(scriptPath: string, opts: WardenExecOptions): Promise<number> {
+  // Capture native import() before SES's lockdown() can patch Function.
+  // new Function prevents tsc (module: CommonJS) from rewriting import() → require().
+  // Must be created before any require('./runtime/...') calls since loading
+  // moduleLoaderHook triggers ses/lockdown when --enforce is active.
+  const { pathToFileURL }    = require('node:url') as typeof import('node:url');
+  const nativeImport         = new Function('url', 'return import(url)') as (url: string) => Promise<unknown>;
+
+  // Lazy imports: avoid loading ses before this command is chosen
+  // (lockdown() must only be called here, not at module-load time)
+  const { installModuleLoaderHook }    = require('./runtime/moduleLoaderHook') as typeof import('./runtime/moduleLoaderHook');
+  const { installEsmLoaderHook }       = require('./runtime/esmLoaderHook') as typeof import('./runtime/esmLoaderHook');
+  const { createViolationHandler }     = require('./runtime/violationHandler') as typeof import('./runtime/violationHandler');
+
+  const violationLog: Array<{ pkg: string; cap: string; api: string; stack?: string }> = [];
+
+  // --on-violation block maps to 'exit' mode; 'log' and 'prompt' both log for now.
+  // 'prompt' is interactive and only meaningful outside --enforce.
+  const resolvedMode = opts.enforce
+    ? 'throw'
+    : opts.onViolationAction === 'block'
+    ? 'exit'
+    : 'log';
+
+  const onViolation = createViolationHandler({
+    mode: resolvedMode,
+    jsonLogging: opts.json,
+    captureStack: opts.stack,
+    onViolation: (event) => {
+      violationLog.push({ pkg: event.packageName, cap: event.capability, api: event.apiAccessed, stack: event.stack });
+    },
+  });
+
+  // ESM violations arrive via MessagePort from the loader thread — calling them
+  // from an event listener in enforce (throw) mode would produce an uncaught
+  // event-loop exception (caught by SES before our try/catch).
+  // ESM enforcement is handled by the loader thread returning stub modules;
+  // we only need to log violations in the main thread.
+  const esmOnViolation = createViolationHandler({
+    mode: 'log',
+    jsonLogging: opts.json,
+    captureStack: opts.stack,
+    onViolation: (event) => {
+      violationLog.push({ pkg: event.packageName, cap: event.capability, api: event.apiAccessed, stack: event.stack });
+    },
+  });
+
+  console.log(chalk.dim(`\n[Warden] > ${opts.label}`));
+
+  const profileLabel    = opts.profile !== 'default' ? chalk.dim(` [${opts.profile}]`) : '';
+  const modeLabel        = opts.enforce
+    ? chalk.yellow.bold('[Warden] enforce mode active — violations will throw') + profileLabel
+    : chalk.cyan.bold('[Warden] observation mode — violations will be logged') + profileLabel;
+  console.log('\n' + modeLabel + '\n');
+
+  // Install CJS hook (Module._load)
+  const uninstallCjs = installModuleLoaderHook(opts.lockfile, opts.enforce, onViolation, opts.profile);
+
+  // Install ESM hook (module.register) — works for import() and ESM scripts
+  const uninstallEsm = installEsmLoaderHook(opts.lockfile, opts.enforce, esmOnViolation, opts.profile);
+
+  // Detect whether the target script is ESM
+  const isEsm = isEsmScript(scriptPath);
+
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+  if (opts.timeoutMs > 0) {
+    timeoutHandle = setTimeout(() => {
+      console.error(chalk.red(`\n[Warden] Timeout: script exceeded ${opts.timeoutMs}ms`));
+      process.exit(1);
+    }, opts.timeoutMs);
+    timeoutHandle.unref();
+  }
+
+  let exitCode = 0;
+  try {
+    if (isEsm) {
+      await nativeImport(pathToFileURL(scriptPath).href);
+    } else {
+      require(scriptPath);
+    }
+  } catch (err) {
+    console.error(chalk.red(`\n[Warden] Script exited with error: ${(err as Error).message}`));
+    exitCode = 1;
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+    uninstallCjs();
+    // Drain pending ESM violation port messages before unregistering listeners.
+    // Port messages from the loader thread are macrotasks — one setImmediate tick
+    // lets the poll phase process them before we remove the listener.
+    if (isEsm) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    uninstallEsm();
+    if (violationLog.length > 0) {
+      console.log(chalk.bold(`\n[Warden] ${violationLog.length} violation(s) recorded:`));
+      for (const v of violationLog) {
+        console.log(`  ${chalk.red('-')} ${v.pkg} → ${v.api} (${v.cap})`);
+      }
+    } else {
+      console.log(chalk.green('\n[Warden] No capability violations detected.'));
+    }
+  }
+
+  return exitCode;
+}
 
 function isEsmScript(scriptPath: string): boolean {
   if (scriptPath.endsWith('.mjs')) return true;
@@ -647,6 +681,8 @@ function buildCacheFromLockfile(lock: LockfileData | null): Map<string, ScanCach
         hasNativeBindings: policy.status === 'unsandboxed',
         unanalyzableFiles: [],
         fileCount: 0,
+        lifecycleScripts: policy.lifecycleScripts ?? [],
+        typosquatOf: policy.typosquatOf ?? null,
       },
     });
   }
@@ -776,8 +812,8 @@ program
 
     const existing    = readLockfile(projectDir);
     const cache       = buildCacheFromLockfile(existing);
-    const results = await scanNodeModules(
-      nodeModulesDir,
+    const results = await scanProject(
+      projectDir,
       cache,
       (done, total, pkg) => printProgress(done, total, pkg),
     );
@@ -853,8 +889,8 @@ program
 
     const existing    = readLockfile(projectDir);
     const cache       = buildCacheFromLockfile(existing);
-    const results = await scanNodeModules(
-      nodeModulesDir,
+    const results = await scanProject(
+      projectDir,
       cache,
       (done, total, pkg) => printProgress(done, total, pkg),
     );
@@ -915,6 +951,119 @@ program
     }
 
     printExplain(result);
+  });
+
+// ─── inspect-script ──────────────────────────────────────────────────────────
+
+const LIFECYCLE_SCRIPT_NAMES = ['preinstall', 'install', 'postinstall'];
+
+// Matches a life-cycle script that is a direct `node <file>` invocation (optionally
+// with node flags), e.g. "node install.js" or "node --no-warnings ./scripts/setup.cjs".
+// Anything else (shell pipelines, node-gyp, prebuilt binary installers, npm-run-all, ...)
+// runs outside Node's module system, so Warden's require/import hooks cannot see it.
+const NODE_FILE_SCRIPT_RE = /^\s*node\s+(?:--[\w-]+(?:=\S+)?\s+)*(["']?)([^\s"']+\.(?:c?js|mjs))\1(?:\s|$)/;
+
+program
+  .command('inspect-script <pkg> [script]')
+  .description("Review (and sandbox-run when possible) a package's npm life-cycle script before approving it")
+  .option('-d, --dir <path>', 'Project directory (default: cwd)', process.cwd())
+  .option('--enforce', 'Block capability violations instead of just logging them')
+  .option('--profile <profile>', 'Policy profile: strict, default, or lenient')
+  .option('--timeout <ms>', 'Kill the script if it runs longer than this many milliseconds')
+  .action(async (
+    pkgArg: string,
+    scriptArg: string | undefined,
+    opts: { dir: string; enforce: boolean; profile?: string; timeout?: string },
+  ) => {
+    const projectDir        = path.resolve(opts.dir);
+    const nodeModulesDir    = path.join(projectDir, 'node_modules');
+
+    if (!fs.existsSync(nodeModulesDir)) {
+      console.error(chalk.red(`Error: No node_modules at ${nodeModulesDir}`));
+      console.error(chalk.dim('  Run `npm install` (or `pnpm install` / `yarn`) first.'));
+      process.exit(2);
+    }
+
+    const pkgDir = pkgArg.startsWith('@')
+      ? path.join(nodeModulesDir, ...pkgArg.split('/'))
+      : path.join(nodeModulesDir, pkgArg);
+
+    let pkgJson: { name?: string; version?: string; scripts?: Record<string, string> };
+    try {
+      pkgJson = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8'));
+    } catch {
+      console.error(chalk.red(`Error: Could not read package.json for "${pkgArg}" under ${nodeModulesDir}.`));
+      process.exit(2);
+    }
+
+    const scripts = pkgJson.scripts ?? {};
+
+    let targets: string[];
+    if (scriptArg) {
+      if (!LIFECYCLE_SCRIPT_NAMES.includes(scriptArg)) {
+        console.error(chalk.red(`Error: "${scriptArg}" is not a life-cycle script. Valid values: ${LIFECYCLE_SCRIPT_NAMES.join(', ')}`));
+        process.exit(2);
+      }
+      if (!scripts[scriptArg]) {
+        console.error(chalk.red(`Error: ${pkgArg} does not declare a "${scriptArg}" script.`));
+        process.exit(2);
+      }
+      targets = [scriptArg];
+    } else {
+      targets = LIFECYCLE_SCRIPT_NAMES.filter(s => !!scripts[s]);
+      if (targets.length === 0) {
+        console.log(chalk.green(`\n  ${pkgArg} declares no life-cycle scripts (preinstall/install/postinstall) — nothing to inspect.`));
+        return;
+      }
+    }
+
+    const lockfile = readLockfile(projectDir);
+    if (!lockfile) {
+      console.error(chalk.red('Error: No warden.lock.json found.'));
+      console.error(chalk.dim('  Run `warden scan` first to generate the lockfile.'));
+      process.exit(2);
+    }
+
+    const config       = readConfig(projectDir);
+    const profile      = (opts.profile ?? config.profile ?? 'default') as import('./runtime/moduleLoaderHook').Profile;
+    const timeoutMs    = opts.timeout ? parseInt(opts.timeout, 10) : 0;
+
+    let anyFailed = false;
+
+    for (const scriptName of targets) {
+      const command = scripts[scriptName];
+      console.log('');
+      console.log(chalk.bold.underline(`Warden Inspect: ${pkgArg} — ${scriptName}`));
+      console.log(chalk.dim(`  Command: ${command}`));
+
+      const match = NODE_FILE_SCRIPT_RE.exec(command);
+      if (!match) {
+        console.log(chalk.yellow('  Cannot be sandboxed automatically — not a direct `node <file>.js` invocation.'));
+        console.log(chalk.dim('  Review the command above manually before approving this package.'));
+        continue;
+      }
+
+      const entryFile = path.resolve(pkgDir, match[2]);
+      if (!fs.existsSync(entryFile)) {
+        console.log(chalk.yellow(`  Cannot be sandboxed — resolved entry file not found: ${entryFile}`));
+        continue;
+      }
+
+      const exitCode = await executeUnderWarden(entryFile, {
+        lockfile,
+        enforce: opts.enforce,
+        profile,
+        timeoutMs,
+        json: false,
+        onViolationAction: 'log',
+        stack: false,
+        label: `Inspecting ${pkgArg} — ${scriptName} (${command})`,
+      });
+      if (exitCode !== 0) anyFailed = true;
+    }
+
+    console.log('');
+    process.exit(anyFailed ? 1 : 0);
   });
 
 // ─── unapprove ───────────────────────────────────────────────────────────────
@@ -1040,13 +1189,20 @@ program
 
 // ─── integrity ───────────────────────────────────────────────────────────────
 
+const DEFAULT_TRUSTED_REGISTRIES = [
+  'https://registry.npmjs.org/',
+  'https://registry.yarnpkg.com/',
+];
+
 program
   .command('integrity')
-  .description('Check that all packages were installed from the npm registry and have integrity hashes')
+  .description('Check that all packages were installed from a trusted registry and have integrity hashes')
   .option('-d, --dir <path>', 'Project directory (default: cwd)', process.cwd())
   .option('--json', 'Output raw JSON')
   .action((opts: { dir: string; json: boolean }) => {
     const projectDir = path.resolve(opts.dir);
+    const config               = readConfig(projectDir);
+    const trustedRegistries    = [...DEFAULT_TRUSTED_REGISTRIES, ...(config.registries ?? [])];
 
     // Try package-lock.json (npm 7+ v3) or node_modules/.package-lock.json
     const lockJsonPath = fs.existsSync(path.join(projectDir, 'package-lock.json'))
@@ -1097,7 +1253,7 @@ program
         continue;
       }
 
-      if (meta.resolved && !meta.resolved.startsWith('https://registry.npmjs.org/') && !meta.resolved.startsWith('https://registry.yarnpkg.com/')) {
+      if (meta.resolved && !trustedRegistries.some(registry => meta.resolved!.startsWith(registry))) {
         issues.push({ package: displayName, issue: `non-registry source: ${meta.resolved}` });
       }
     }
@@ -1125,6 +1281,125 @@ program
     console.log('');
 
     process.exit(issues.length > 0 ? 1 : 0);
+  });
+
+// ─── ci ──────────────────────────────────────────────────────────────────────
+
+interface CiIntegrityResult { checked: number; issues: Array<{ package: string; issue: string }>; }
+interface CiVerifyResult { ok: boolean; violations: string[]; }
+interface CiAuditResult { total: number; byCapability: Record<string, string[]>; }
+
+const CI_HIGH_RISK_CAPS = new Set(['network', 'process-spawn', 'dynamic-code', 'native-binding']);
+
+program
+  .command('ci')
+  .description('Run integrity, verify, and audit together as a single CI gate (one exit code)')
+  .option('-d, --dir <path>', 'Project directory (default: cwd)', process.cwd())
+  .option('--json', 'Output a single machine-readable JSON summary')
+  .action((opts: { dir: string; json: boolean }) => {
+    const projectDir    = path.resolve(opts.dir);
+    const cliScript      = process.argv[1];
+
+    const runSubcommand = (name: string): { status: number; stdout: string; stderr: string } => {
+      const result = spawnSync(process.execPath, [cliScript, name, '--dir', projectDir, '--json'], { encoding: 'utf8' });
+      return { status: result.status ?? 2, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
+    };
+
+    // integrity only understands package-lock.json today — skip rather than
+    // hard-fail on pnpm/yarn projects instead of blocking the whole gate on it.
+    const hasPackageLock =
+      fs.existsSync(path.join(projectDir, 'package-lock.json')) ||
+      fs.existsSync(path.join(projectDir, 'node_modules', '.package-lock.json'));
+
+    let integrityStatus: 'ok' | 'failed' | 'skipped'    = 'skipped';
+    let integrityResult: CiIntegrityResult | null       = null;
+    let integrityError: string | null                   = null;
+
+    if (hasPackageLock) {
+      const { status, stdout, stderr } = runSubcommand('integrity');
+      try {
+        integrityResult    = JSON.parse(stdout) as CiIntegrityResult;
+        integrityStatus    = status === 0 ? 'ok' : 'failed';
+      } catch {
+        integrityStatus    = 'failed';
+        integrityError     = stderr.trim() || 'warden integrity did not produce valid output';
+      }
+    }
+
+    const { stdout: verifyStdout, stderr: verifyStderr }    = runSubcommand('verify');
+    let verifyResult: CiVerifyResult;
+    let verifyError: string | null = null;
+    try {
+      verifyResult = JSON.parse(verifyStdout) as CiVerifyResult;
+    } catch {
+      verifyResult    = { ok: false, violations: [] };
+      verifyError     = verifyStderr.trim() || 'warden verify did not produce valid output';
+    }
+
+    const { stdout: auditStdout }    = runSubcommand('audit');
+    let auditResult: CiAuditResult | null = null;
+    try {
+      auditResult = JSON.parse(auditStdout) as CiAuditResult;
+    } catch { /* audit is informational only — ignore parse failures */ }
+
+    const highRiskCount = auditResult
+      ? new Set(
+          Object.entries(auditResult.byCapability)
+            .filter(([cap]) => CI_HIGH_RISK_CAPS.has(cap))
+            .flatMap(([, pkgs]) => pkgs),
+        ).size
+      : 0;
+
+    const ok = integrityStatus !== 'failed' && verifyResult.ok;
+
+    if (opts.json) {
+      console.log(JSON.stringify({
+        ok,
+        integrity: integrityStatus === 'skipped' ? null : { ok: integrityStatus === 'ok', ...integrityResult, error: integrityError },
+        verify: { ...verifyResult, error: verifyError },
+        audit: auditResult ? { total: auditResult.total, highRisk: highRiskCount } : null,
+      }, null, 2));
+      process.exit(ok ? 0 : 1);
+    }
+
+    console.log('');
+    console.log(chalk.bold.underline('Warden CI'));
+    console.log('');
+
+    if (integrityStatus === 'skipped') {
+      console.log(`  ${chalk.dim('~')} integrity   ${chalk.dim('skipped — no package-lock.json found (pnpm/yarn lockfiles not supported yet)')}`);
+    } else if (integrityStatus === 'ok') {
+      console.log(`  ${chalk.green('+')} integrity   ${chalk.green('ok')} ${chalk.dim(`(${integrityResult?.checked ?? 0} package(s) checked)`)}`);
+    } else if (integrityError) {
+      console.log(`  ${chalk.red('x')} integrity   ${chalk.red(integrityError)}`);
+    } else {
+      console.log(`  ${chalk.red('x')} integrity   ${chalk.red(`${integrityResult?.issues.length ?? 0} issue(s)`)}`);
+      for (const issue of integrityResult?.issues ?? []) {
+        console.log(`      ${chalk.red('-')} ${issue.package}: ${issue.issue}`);
+      }
+    }
+
+    if (verifyError) {
+      console.log(`  ${chalk.red('x')} verify      ${chalk.red(verifyError)}`);
+    } else if (verifyResult.ok) {
+      console.log(`  ${chalk.green('+')} verify      ${chalk.green('ok')}`);
+    } else {
+      console.log(`  ${chalk.red('x')} verify      ${chalk.red(`${verifyResult.violations.length} violation(s)`)}`);
+      for (const v of verifyResult.violations) {
+        console.log(`      ${chalk.red('-')} ${v}`);
+      }
+    }
+
+    if (auditResult) {
+      const riskLabel = highRiskCount > 0 ? chalk.yellow(`${highRiskCount} high-risk`) : chalk.green('0 high-risk');
+      console.log(`  ${chalk.cyan('i')} audit       ${auditResult.total} package(s) scanned, ${riskLabel}`);
+    }
+
+    console.log('');
+    console.log(ok ? chalk.green.bold('  CI gate passed.') : chalk.red.bold('  CI gate failed.'));
+    console.log('');
+
+    process.exit(ok ? 0 : 1);
   });
 
 // ─── report ──────────────────────────────────────────────────────────────────
@@ -1173,7 +1448,12 @@ program
       process.exit(1);
     }
 
+    const watchTargets = discoverScanTargets(projectDir);
+
     console.log(chalk.bold('\nWarden watch — monitoring node_modules for changes...'));
+    if (watchTargets.length > 1) {
+      console.log(chalk.dim(`  Watching ${watchTargets.length} node_modules (root + ${watchTargets.length - 1} workspace package(s)).`));
+    }
     console.log(chalk.dim('  Press Ctrl+C to stop.\n'));
 
     let debounce: ReturnType<typeof setTimeout> | null = null;
@@ -1182,7 +1462,7 @@ program
       console.log(chalk.dim('\n[warden watch] Change detected — rescanning...'));
       try {
         const cache          = buildCacheFromLockfile(currentLock);
-        const results        = await scanNodeModules(nodeModulesDir, cache);
+        const results        = await scanProject(projectDir, cache);
         const newPolicies    = buildPolicyMap(results);
         const newLock        = mergeLockfile(null, newPolicies);
 
@@ -1199,10 +1479,12 @@ program
       }
     };
 
-    fs.watch(nodeModulesDir, { recursive: true }, () => {
-      if (debounce) clearTimeout(debounce);
-      debounce = setTimeout(() => { void rescan(); }, 1000);
-    });
+    for (const target of watchTargets) {
+      fs.watch(target.nodeModulesDir, { recursive: true }, () => {
+        if (debounce) clearTimeout(debounce);
+        debounce = setTimeout(() => { void rescan(); }, 1000);
+      });
+    }
   });
 
 // ─── config init ─────────────────────────────────────────────────────────────
@@ -1243,12 +1525,16 @@ configCmd
     const ignoreAnswer    = await ask('  Packages to ignore in warden verify (comma-separated, leave empty for none): ');
     const ignore          = ignoreAnswer ? ignoreAnswer.split(',').map(s => s.trim()).filter(Boolean) : [];
 
+    const registriesAnswer    = await ask('  Private registry URLs trusted by warden integrity (comma-separated, leave empty for none): ');
+    const registries          = registriesAnswer ? registriesAnswer.split(',').map(s => s.trim()).filter(Boolean) : [];
+
     rl.close();
 
     const config = {
       ...(profile !== 'default' ? { profile } : {}),
       ...(autoApprove ? { autoApprove } : {}),
       ...(ignore.length > 0 ? { ignore } : {}),
+      ...(registries.length > 0 ? { registries } : {}),
     };
 
     fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
