@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { scanFile } from '../src/analyzer/astScanner';
+import { scanFile, scanFileHeuristic } from '../src/analyzer/astScanner';
 import type { Capability } from '../src/analyzer/capabilityMap';
 
 function caps(source: string): Capability[] {
@@ -325,5 +325,77 @@ describe('static resolution of simple dynamic require()', () => {
       import(MOD).then(fs => fs.readFileSync('./x'));
     `);
     expect(result).toContain('filesystem-read');
+  });
+});
+
+// ─── global fetch() / WebSocket (no import needed) ───────────────────────────
+
+describe('global fetch() and WebSocket detection', () => {
+  it('detects a bare fetch() call as network', () => {
+    const result = caps(`fetch('https://evil.example.com').then(r => r.json());`);
+    expect(result).toContain('network');
+  });
+
+  it('detects globalThis.fetch()', () => {
+    const result = caps(`globalThis.fetch('https://evil.example.com');`);
+    expect(result).toContain('network');
+  });
+
+  it('detects global.fetch()', () => {
+    const result = caps(`global.fetch('https://evil.example.com');`);
+    expect(result).toContain('network');
+  });
+
+  it('detects self.fetch()', () => {
+    const result = caps(`self.fetch('https://evil.example.com');`);
+    expect(result).toContain('network');
+  });
+
+  it('detects new WebSocket(...)', () => {
+    const result = caps(`const ws = new WebSocket('wss://evil.example.com');`);
+    expect(result).toContain('network');
+  });
+
+  it('does not flag a locally shadowed fetch (const binding)', () => {
+    const result = caps(`
+      const fetch = (url) => myCustomHttpClient(url);
+      fetch('https://internal.example.com');
+    `);
+    expect(result).not.toContain('network');
+  });
+
+  it('does not flag a locally shadowed fetch (function parameter)', () => {
+    const result = caps(`
+      function doRequest(fetch) {
+        return fetch('https://internal.example.com');
+      }
+    `);
+    expect(result).not.toContain('network');
+  });
+
+  it('does not flag a locally shadowed WebSocket', () => {
+    const result = caps(`
+      class WebSocket {}
+      const ws = new WebSocket();
+    `);
+    expect(result).not.toContain('network');
+  });
+
+  it('still detects unrelated capabilities alongside an unrelated identifier named fetch-like', () => {
+    // Sanity check: unrelated code with no fetch/WebSocket usage stays clean.
+    const result = caps(`const x = 1 + 2;`);
+    expect(result).toEqual([]);
+  });
+});
+
+describe('global fetch()/WebSocket detection — heuristic fallback', () => {
+  it('detects fetch() in the oversized/unparseable-file heuristic', () => {
+    const result = [...scanFileHeuristic(`fetch('https://evil.example.com')`)];
+    expect(result).toContain('network');
+  });
+
+  it('detects new WebSocket(...) in the oversized/unparseable-file heuristic', () => {
+    const result = [...scanFileHeuristic(`new WebSocket('wss://evil.example.com')`)];
+    expect(result).toContain('network');
   });
 });

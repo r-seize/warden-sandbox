@@ -20,6 +20,10 @@ export function scanFileHeuristic(source: string): Set<Capability> {
   if (/process\.env/.test(source)) caps.add('env-access');
   if (/require\(['"](?:child_process|node:child_process)['"]\)/.test(source)) caps.add('process-spawn');
   if (/require\(['"](?:http|https|net|tls|dns|dgram|node:http|node:https|node:net|node:tls)['"]\)/.test(source)) caps.add('network');
+  // Global fetch()/WebSocket — no import/require needed since Node >= 18 (fetch) / >= 22 (WebSocket).
+  // No shadowing check here (unlike the AST path): this fallback only runs on files the AST
+  // parser couldn't handle, so there's no reliable binding information to check against.
+  if (/\bfetch\s*\(/.test(source) || /\bnew\s+WebSocket\s*\(/.test(source)) caps.add('network');
   if (/require\(['"](?:fs|node:fs)['"]\)/.test(source)) {
     caps.add('filesystem-read');
     if (/\b(?:writeFile|appendFile|mkdir|unlink|rename|createWriteStream)\b/.test(source)) {

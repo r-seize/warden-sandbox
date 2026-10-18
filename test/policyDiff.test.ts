@@ -108,6 +108,77 @@ describe('diffLockfiles', () => {
     expect(summary.diffs[0].kind).toBe('new-capability');
     expect(summary.diffs[1].kind).toBe('new-package');
   });
+
+  it('flags a new package that is a typosquat even with zero declared capabilities', () => {
+    const old = makeLock({});
+    const next = makeLock({
+      'lodahs@1.0.0': { contentHash: 'sha256:abc', capabilities: [], status: 'pending-review', typosquatOf: 'lodash' },
+    });
+    const summary = diffLockfiles(old, next);
+    expect(summary.diffs[0].kind).toBe('new-package');
+    expect(summary.diffs[0].typosquatOf).toBe('lodash');
+    expect(summary.packagesWithNewRiskFlags).toBe(1);
+  });
+
+  it('flags a new life-cycle script on a new package with zero capabilities', () => {
+    const old = makeLock({});
+    const next = makeLock({
+      'scripted@1.0.0': { contentHash: 'sha256:abc', capabilities: [], status: 'pending-review', lifecycleScripts: ['postinstall'] },
+    });
+    const summary = diffLockfiles(old, next);
+    expect(summary.diffs[0].newLifecycleScripts).toEqual(['postinstall']);
+    expect(summary.packagesWithNewRiskFlags).toBe(1);
+  });
+
+  it('flags a new typosquat match on an existing package as risk-flag-changed, not unchanged', () => {
+    const old = makeLock({
+      'lodahs@1.0.0': { contentHash: 'sha256:abc', capabilities: [], status: 'approved' },
+    });
+    const next = makeLock({
+      'lodahs@1.0.0': { contentHash: 'sha256:abc', capabilities: [], status: 'pending-review', typosquatOf: 'lodash' },
+    });
+    const summary = diffLockfiles(old, next);
+    expect(summary.diffs[0].kind).toBe('risk-flag-changed');
+    expect(summary.diffs[0].typosquatOf).toBe('lodash');
+    expect(summary.packagesWithNewRiskFlags).toBe(1);
+    expect(summary.unchanged).toBe(0);
+  });
+
+  it('flags a newly added life-cycle script on an existing package with unchanged capabilities', () => {
+    const old = makeLock({
+      'some-lib@1.0.0': { contentHash: 'sha256:aaa', capabilities: ['filesystem-read'], status: 'approved' },
+    });
+    const next = makeLock({
+      'some-lib@1.0.0': { contentHash: 'sha256:bbb', capabilities: ['filesystem-read'], status: 'pending-review', lifecycleScripts: ['postinstall'] },
+    });
+    const summary = diffLockfiles(old, next);
+    expect(summary.diffs[0].kind).toBe('risk-flag-changed');
+    expect(summary.diffs[0].newLifecycleScripts).toEqual(['postinstall']);
+  });
+
+  it('does not re-flag a typosquat match that was already present on the old policy', () => {
+    const old = makeLock({
+      'lodahs@1.0.0': { contentHash: 'sha256:abc', capabilities: [], status: 'pending-review', typosquatOf: 'lodash' },
+    });
+    const next = makeLock({
+      'lodahs@1.0.0': { contentHash: 'sha256:abc', capabilities: [], status: 'pending-review', typosquatOf: 'lodash' },
+    });
+    const summary = diffLockfiles(old, next);
+    expect(summary.diffs[0].kind).toBe('unchanged');
+    expect(summary.packagesWithNewRiskFlags).toBe(0);
+  });
+
+  it('does not re-flag a life-cycle script that was already present on the old policy', () => {
+    const old = makeLock({
+      'scripted@1.0.0': { contentHash: 'sha256:abc', capabilities: [], status: 'pending-review', lifecycleScripts: ['postinstall'] },
+    });
+    const next = makeLock({
+      'scripted@1.0.0': { contentHash: 'sha256:abc', capabilities: [], status: 'pending-review', lifecycleScripts: ['postinstall'] },
+    });
+    const summary = diffLockfiles(old, next);
+    expect(summary.diffs[0].kind).toBe('unchanged');
+    expect(summary.packagesWithNewRiskFlags).toBe(0);
+  });
 });
 
 describe('diffHasSecurityRelevantChanges', () => {
@@ -143,5 +214,12 @@ describe('diffHasSecurityRelevantChanges', () => {
       'pkg@1.0.0': { contentHash: 'sha256:aaa', capabilities: [], status: 'approved' },
     });
     expect(diffHasSecurityRelevantChanges(diffLockfiles(lock, lock))).toBe(false);
+  });
+
+  it('returns true for a new typosquat with zero capabilities', () => {
+    const next = makeLock({
+      'lodahs@1.0.0': { contentHash: 'sha256:abc', capabilities: [], status: 'pending-review', typosquatOf: 'lodash' },
+    });
+    expect(diffHasSecurityRelevantChanges(diffLockfiles(null, next))).toBe(true);
   });
 });

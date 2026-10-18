@@ -49,6 +49,10 @@ interface ExportAllDeclNode       extends BaseNode { type: 'ExportAllDeclaration
 
 type AstNode = acorn.Node & Record<string, unknown>;
 
+// Identifiers that refer to the global object — used to recognise
+// `globalThis.fetch(...)` / `global.fetch(...)` / `self.fetch(...)`.
+const GLOBAL_OBJECT_NAMES = new Set(['globalThis', 'global', 'self']);
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /** A detected capability at a specific source range (character positions). */
@@ -112,6 +116,13 @@ export function analyzeSource(source: string, collectEvidence = false): Analysis
       }
     },
   });
+
+  // Names locally declared or reassigned anywhere in the file (any variable,
+  // function name, function/arrow parameter, or import binding). Used to avoid
+  // treating a shadowed/mocked `fetch`/`WebSocket` as the real global API —
+  // file-wide rather than true scope analysis, so it errs toward NOT flagging
+  // when in doubt (a missed detection here is safer than a false attribution).
+  const declaredNames = collectDeclaredNames(ast);
 
   // ── Pass 1 : collect module bindings ──────────────────────────────────────
   // varName → module specifier  (const fs = require('fs') / import fs from 'fs')
@@ -259,10 +270,33 @@ export function analyzeSource(source: string, collectEvidence = false): Analysis
         return;
       }
 
+      // Global fetch() — available in Node >= 18 without any import/require.
+      // Only flagged when 'fetch' isn't declared/reassigned anywhere in the file,
+      // so a locally shadowed or mocked `fetch` isn't mistaken for the real API.
+      if (
+        callee.type === 'Identifier' &&
+        (callee as unknown as IdentifierNode).name === 'fetch' &&
+        !declaredNames.has('fetch')
+      ) {
+        addCapability('network', node.start, node.end);
+        return;
+      }
+
       if (callee.type === 'MemberExpression') {
         const mem           = callee as unknown as MemberExprNode;
         const methodName    = getMemberProp(mem);
         const obj           = mem.object as unknown as AstNode;
+
+        // globalThis.fetch(...) / global.fetch(...) / self.fetch(...)
+        if (
+          obj.type === 'Identifier' &&
+          GLOBAL_OBJECT_NAMES.has((obj as unknown as IdentifierNode).name) &&
+          methodName === 'fetch' &&
+          !declaredNames.has('fetch')
+        ) {
+          addCapability('network', node.start, node.end);
+          return;
+        }
 
         // require('fs').readFile(...)
         const objMod = extractRequiredModule(obj, constStrings);
@@ -295,12 +329,18 @@ export function analyzeSource(source: string, collectEvidence = false): Analysis
       }
     },
 
-    // ── new Function('...') ────────────────────────────────────────────────
+    // ── new Function('...') / new WebSocket(...) ───────────────────────────
     NewExpression(rawNode) {
       const node      = rawNode as unknown as NewExprNode;
       const callee    = node.callee as unknown as AstNode;
-      if (callee.type === 'Identifier' && (callee as unknown as IdentifierNode).name === 'Function') {
+      if (callee.type !== 'Identifier') return;
+      const name = (callee as unknown as IdentifierNode).name;
+
+      if (name === 'Function') {
         addCapability('dynamic-code', node.start, node.end);
+      } else if (name === 'WebSocket' && !declaredNames.has('WebSocket')) {
+        // Global WebSocket — available in Node >= 22 (or via polyfills) without any import.
+        addCapability('network', node.start, node.end);
       }
     },
 
@@ -438,6 +478,92 @@ function evaluateStaticString(node: AstNode, constStrings: Map<string, string>):
     default:
       return null;
   }
+}
+
+/** Add every plain-Identifier name in a binding pattern (Identifier, or nested
+ *  Object/Array destructuring) to `out`. Non-identifier targets are skipped. */
+function collectPatternNames(pattern: AstNode | null | undefined, out: Set<string>): void {
+  if (!pattern) return;
+  switch (pattern.type) {
+    case 'Identifier':
+      out.add((pattern as unknown as IdentifierNode).name);
+      break;
+    case 'AssignmentPattern': {
+      const node = pattern as unknown as { left: AstNode };
+      collectPatternNames(node.left, out);
+      break;
+    }
+    case 'RestElement': {
+      const node = pattern as unknown as { argument: AstNode };
+      collectPatternNames(node.argument, out);
+      break;
+    }
+    case 'ObjectPattern': {
+      const node = pattern as unknown as { properties: Array<{ type: string; value?: AstNode; argument?: AstNode }> };
+      for (const prop of node.properties) {
+        collectPatternNames((prop.value ?? prop.argument) as AstNode | undefined, out);
+      }
+      break;
+    }
+    case 'ArrayPattern': {
+      const node = pattern as unknown as { elements: Array<AstNode | null> };
+      for (const el of node.elements) collectPatternNames(el, out);
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+/**
+ * Collect every name declared or reassigned anywhere in the file: variables
+ * (any kind, including destructured), function/class names, function and
+ * arrow parameters, and import bindings. This is file-wide, not true scope
+ * analysis — good enough to tell "is this name ever something other than
+ * the global it looks like" without the complexity of real scope tracking.
+ */
+function collectDeclaredNames(ast: acorn.Program): Set<string> {
+  const names = new Set<string>();
+
+  walk.simple(ast as unknown as acorn.Node, {
+    VariableDeclarator(rawNode) {
+      const node = rawNode as unknown as VarDeclNode;
+      collectPatternNames(node.id as unknown as AstNode, names);
+    },
+    AssignmentExpression(rawNode) {
+      const node = rawNode as unknown as AssignExprNode;
+      collectPatternNames(node.left as unknown as AstNode, names);
+    },
+    FunctionDeclaration(rawNode) {
+      const node = rawNode as unknown as { id: IdentifierNode | null; params: AstNode[] };
+      if (node.id) names.add(node.id.name);
+      for (const p of node.params) collectPatternNames(p, names);
+    },
+    FunctionExpression(rawNode) {
+      const node = rawNode as unknown as { id: IdentifierNode | null; params: AstNode[] };
+      if (node.id) names.add(node.id.name);
+      for (const p of node.params) collectPatternNames(p, names);
+    },
+    ArrowFunctionExpression(rawNode) {
+      const node = rawNode as unknown as { params: AstNode[] };
+      for (const p of node.params) collectPatternNames(p, names);
+    },
+    ClassDeclaration(rawNode) {
+      const node = rawNode as unknown as { id: IdentifierNode | null };
+      if (node.id) names.add(node.id.name);
+    },
+    ImportDefaultSpecifier(rawNode) {
+      names.add((rawNode as unknown as ImportDefaultSpecNode).local.name);
+    },
+    ImportSpecifier(rawNode) {
+      names.add((rawNode as unknown as ImportSpecNode).local.name);
+    },
+    ImportNamespaceSpecifier(rawNode) {
+      names.add((rawNode as unknown as ImportNamespaceSpecNode).local.name);
+    },
+  });
+
+  return names;
 }
 
 function getMemberProp(node: MemberExprNode): string | null {

@@ -64,6 +64,41 @@ describe('riskScore', () => {
     const score = riskScore(policy(['network', 'process-spawn', 'dynamic-code'], 'pending-review'));
     expect(score).toBe(100);
   });
+
+  it('adds a 50 bonus when the package is a likely typosquat', () => {
+    const clean      = policy([]);
+    const typosquat  = { ...policy([], 'pending-review'), typosquatOf: 'lodash' };
+    // pending-review(20) + typosquat(50) = 70
+    expect(riskScore(typosquat)).toBe(70);
+    expect(riskScore(typosquat) - riskScore(clean)).toBeGreaterThan(0);
+  });
+
+  it('adds a 15 bonus when the package declares life-cycle scripts', () => {
+    const base       = policy(['filesystem-read']); // 5
+    const withScript  = { ...base, lifecycleScripts: ['postinstall'] };
+    expect(riskScore(withScript) - riskScore(base)).toBe(15);
+  });
+
+  it('does not add a life-cycle bonus for an empty lifecycleScripts array', () => {
+    const base      = policy(['filesystem-read']);
+    const withEmpty = { ...base, lifecycleScripts: [] };
+    expect(riskScore(withEmpty)).toBe(riskScore(base));
+  });
+
+  it('combines typosquat and life-cycle bonuses, still capped at 100', () => {
+    const risky = {
+      ...policy(['network', 'process-spawn'], 'pending-review'),
+      typosquatOf: 'lodash',
+      lifecycleScripts: ['postinstall'],
+    };
+    // network(40) + process-spawn(35) + pending(20) + typosquat(50) + lifecycle(15) = 160 → capped
+    expect(riskScore(risky)).toBe(100);
+  });
+
+  it('a typosquat with zero capabilities still lands as CRITICAL', () => {
+    const typosquat = { ...policy([], 'pending-review'), typosquatOf: 'lodash' };
+    expect(riskLabel(riskScore(typosquat))).toBe('CRITICAL');
+  });
 });
 
 describe('riskLabel', () => {

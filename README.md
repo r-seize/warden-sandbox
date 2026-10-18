@@ -137,7 +137,7 @@ Packages with detected capabilities:
 
 ### `warden diff`
 
-Compares the current state of `node_modules` against the committed lockfile and reports any capability changes. Run this after `npm update` to understand the security impact before approving anything. In a monorepo, every workspace package's `node_modules` is scanned too (see [warden scan](#warden-scan)).
+Compares the current state of `node_modules` against the committed lockfile and reports any capability changes **and any new risk flags** — a package becoming a likely typosquat match, or gaining a life-cycle script, is surfaced even if it declares zero capabilities, which is often exactly the case for a package that's just trying to get installed unnoticed. Run this after `npm update` to understand the security impact before approving anything. In a monorepo, every workspace package's `node_modules` is scanned too (see [warden scan](#warden-scan)).
 
 ```
 warden diff [--dir <path>] [--from <lockfile>] [--to <lockfile>] [--since <date>] [-v]
@@ -167,6 +167,21 @@ Warden Diff
   some-lib@3.1.0
     + Added:   [NETWORK]
     note: New capabilities detected after update: network.
+```
+
+**Example output — a zero-capability typosquat, still caught:**
+
+```
+Warden Diff
+  New packages:           1
+  New capabilities:       0
+  New risk flags:         1 (typosquat / life-cycle script)
+
+  New packages with capabilities or risk flags:
+
+  lodahs@1.0.0
+     !  Possible typosquat of "lodash"
+    note: Package name is one character away from popular package "lodash" — possible typosquat, verify this is the package you intended to install.
 ```
 
 ### `warden verify`
@@ -729,7 +744,7 @@ Create it interactively with `warden config init`, or write it manually.
 
 | Label | Key | What it covers |
 |---|---|---|
-| `[NETWORK]` | `network` | `node:http`, `node:https`, `node:net`, `node:tls`, `node:dns`, `node:dgram`, `node:http2` |
+| `[NETWORK]` | `network` | `node:http`, `node:https`, `node:net`, `node:tls`, `node:dns`, `node:dgram`, `node:http2`, global `fetch()` / `WebSocket` (no import needed) |
 | `[SPAWN]` | `process-spawn` | `node:child_process`, `node:cluster`, `node:worker_threads` |
 | `[EVAL]` | `dynamic-code` | `eval`, `new Function()`, `node:vm` |
 | `[NATIVE]` | `native-binding` | `.node` binary addon |
@@ -796,6 +811,10 @@ A `.node` addon is a compiled binary loaded directly into the process. Warden de
 ### Install-time scripts are not sandboxed
 
 Warden's hooks only exist once a script `require`s/`import`s a package — they cannot intercept `preinstall`/`install`/`postinstall` scripts, which run earlier, during `npm install`. `warden scan` detects and flags packages that declare these scripts (visible in the scan summary, `warden audit`, and `warden report`) so you know to review them manually. `warden inspect-script` can sandbox-run the common case — a script that is a direct `node <file>.js` invocation — but anything else (shell pipelines, `node-gyp`, prebuilt binary installers) is still outside Warden's reach and is only ever shown for manual review, never executed by Warden.
+
+### Global fetch()/WebSocket shadowing check is file-wide, not true scope analysis
+
+`fetch(...)` and `new WebSocket(...)` are flagged as `network` without requiring an import, since both are globals since Node 18 (`fetch`) / 22 (`WebSocket`). To avoid flagging a package that defines its own local `fetch` (a common test-mocking or polyfill pattern), Warden skips the check if `fetch`/`WebSocket` is declared or reassigned *anywhere* in the file — not scoped to the specific function. A file that shadows `fetch` in one function and calls the real global `fetch` in another will not be flagged; this is a deliberate trade-off toward fewer false positives.
 
 ### The typosquat list is small, static, and offline
 

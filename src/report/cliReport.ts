@@ -125,6 +125,7 @@ export function printDiffSummary(summary: DiffSummary, verbose = false): void {
   const hasChanges = summary.newPackages > 0
     || summary.removedPackages > 0
     || summary.packagesWithNewCapabilities > 0
+    || summary.packagesWithNewRiskFlags > 0
     || summary.packagesWithContentChanges > 0;
 
   console.log('');
@@ -132,6 +133,7 @@ export function printDiffSummary(summary: DiffSummary, verbose = false): void {
   console.log(`  New packages:           ${summary.newPackages > 0 ? chalk.yellow(String(summary.newPackages)) : chalk.green('0')}`);
   console.log(`  Removed packages:       ${String(summary.removedPackages)}`);
   console.log(`  New capabilities:       ${summary.packagesWithNewCapabilities > 0 ? chalk.red(String(summary.packagesWithNewCapabilities)) : chalk.green('0')}`);
+  console.log(`  New risk flags:         ${summary.packagesWithNewRiskFlags > 0 ? chalk.red(String(summary.packagesWithNewRiskFlags)) : chalk.green('0')} ${chalk.dim('(typosquat / life-cycle script)')}`);
   console.log(`  Content-only changes:   ${String(summary.packagesWithContentChanges)}`);
   console.log(`  Unchanged:              ${chalk.dim(String(summary.unchanged))}`);
   console.log('');
@@ -152,10 +154,24 @@ export function printDiffSummary(summary: DiffSummary, verbose = false): void {
     }
   }
 
-  // New packages
-  const newPkgDiffs = diffs.filter(d => d.kind === 'new-package' && d.addedCapabilities.length > 0);
+  // Risk-flag-only changes: no new capability, but a typosquat match or a new
+  // life-cycle script appeared on an already-known package.
+  const riskFlagDiffs = diffs.filter(d => d.kind === 'risk-flag-changed');
+  if (riskFlagDiffs.length > 0) {
+    console.log(chalk.red.bold('  !! Packages with NEW risk flags (review required):'));
+    console.log('');
+    for (const d of riskFlagDiffs) {
+      printPackageDiff(d);
+    }
+  }
+
+  // New packages — flagged if they carry capabilities OR a risk flag (a typosquat
+  // with zero declared capabilities is still exactly the kind of thing to review).
+  const newPkgDiffs = diffs.filter(d =>
+    d.kind === 'new-package' && (d.addedCapabilities.length > 0 || d.typosquatOf || d.newLifecycleScripts.length > 0),
+  );
   if (newPkgDiffs.length > 0) {
-    console.log(chalk.yellow.bold('  New packages with capabilities:'));
+    console.log(chalk.yellow.bold('  New packages with capabilities or risk flags:'));
     console.log('');
     for (const d of newPkgDiffs) {
       printPackageDiff(d);
@@ -181,6 +197,12 @@ function printPackageDiff(d: PackageDiff): void {
   }
   if (d.removedCapabilities.length > 0) {
     console.log(`    ${chalk.green('-')} Removed: ${d.removedCapabilities.map(c => chalk.dim(c)).join('  ')}`);
+  }
+  if (d.typosquatOf) {
+    console.log(`    ${chalk.bgRed.white(' ! ')} ${chalk.red(`Possible typosquat of "${d.typosquatOf}"`)}`);
+  }
+  if (d.newLifecycleScripts.length > 0) {
+    console.log(`    ${chalk.yellow('!')} New life-cycle script(s): ${d.newLifecycleScripts.join(', ')}`);
   }
   if (d.newPolicy?.note) {
     console.log(`    ${chalk.dim('note:')} ${d.newPolicy.note}`);
