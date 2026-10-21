@@ -231,6 +231,14 @@ program
         continue;
       }
 
+      // Checked independently of the content-hash branch below: a typosquat match is a
+      // property of the package NAME, so it can newly apply to an already-approved,
+      // content-unchanged entry (e.g. after upgrading warden to a version with a larger
+      // typosquat list, or one that didn't have this detection at all).
+      if (newPolicy.typosquatOf && newPolicy.typosquatOf !== lockedPolicy.typosquatOf) {
+        violations.push(`${key}: package name is a likely typosquat of "${newPolicy.typosquatOf}" — re-review required`);
+      }
+
       if (lockedPolicy.contentHash !== newPolicy.contentHash) {
         violations.push(`${key}: content hash changed (package modified since last scan)`);
         continue;
@@ -752,6 +760,9 @@ program
       const LOW_RISK_ONLY = new Set(['env-access', 'filesystem-read']);
       const toFix = Object.entries(lockfile.packages).filter(([, p]) => {
         if (p.status !== 'pending-review') return false;
+        // A typosquat match is never "low-risk" regardless of declared capabilities —
+        // a zero-capability package otherwise passes `[].every(...)` vacuously.
+        if (p.typosquatOf) return false;
         return p.capabilities.every(c => LOW_RISK_ONLY.has(c));
       });
 

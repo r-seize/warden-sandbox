@@ -543,6 +543,17 @@ export function generateMarkdownReport(lock: LockfileData): string {
   return lines.join('\n');
 }
 
+// ─── Violation rule IDs (shared by JUnit and SARIF reports) ──────────────────
+
+/** Map a `warden verify` violation message to a stable rule ID, for JUnit/SARIF output. */
+function violationRuleId(violation: string): string {
+  if (violation.includes('not in lockfile')) return 'WARDEN004';
+  if (violation.includes('typosquat')) return 'WARDEN005';
+  if (violation.includes('content hash')) return 'WARDEN001';
+  if (violation.includes('new capabilities')) return 'WARDEN002';
+  return 'WARDEN003';
+}
+
 // ─── JUnit XML report ────────────────────────────────────────────────────────
 
 /**
@@ -562,11 +573,8 @@ export function generateJUnitReport(violations: string[], elapsedSec = 0): strin
   const testCases = violations.length === 0
     ? '    <testcase name="warden-verify" classname="warden" time="0"/>\n'
     : violations.map(v => {
-        const pkgKey                                       = v.split(':')[0] ?? 'unknown';
-        let ruleId                                         = 'WARDEN003';
-        if (v.includes('not in lockfile')) ruleId          = 'WARDEN004';
-        else if (v.includes('content hash')) ruleId        = 'WARDEN001';
-        else if (v.includes('new capabilities')) ruleId    = 'WARDEN002';
+        const pkgKey    = v.split(':')[0] ?? 'unknown';
+        const ruleId    = violationRuleId(v);
         return (
           `    <testcase name     = "${escapeXml(pkgKey)}" classname="warden" time="0">\n` +
           `      <failure type    = "${ruleId}" message="${escapeXml(v)}">${escapeXml(v)}</failure>\n` +
@@ -593,11 +601,8 @@ export function generateJUnitReport(violations: string[], elapsedSec = 0): strin
  */
 export function generateSarifReport(violations: string[]): object {
   const sarifResults = violations.map(v => {
-    let ruleId                                         = 'WARDEN003';
-    if (v.includes('not in lockfile')) ruleId          = 'WARDEN004';
-    else if (v.includes('content hash')) ruleId        = 'WARDEN001';
-    else if (v.includes('new capabilities')) ruleId    = 'WARDEN002';
-    const pkgKey                                       = v.split(':')[0];
+    const ruleId    = violationRuleId(v);
+    const pkgKey    = v.split(':')[0];
     return {
       ruleId,
       level: 'error',
@@ -624,6 +629,7 @@ export function generateSarifReport(violations: string[]): object {
             { id: 'WARDEN002', name: 'NewCapabilities', shortDescription: { text: 'Package gained new capabilities' } },
             { id: 'WARDEN003', name: 'PendingReview', shortDescription: { text: 'Package not yet approved' } },
             { id: 'WARDEN004', name: 'NotInLockfile', shortDescription: { text: 'Package not registered in lockfile' } },
+            { id: 'WARDEN005', name: 'TyposquatDetected', shortDescription: { text: 'Package name is a likely typosquat of a popular package' } },
           ],
         },
       },

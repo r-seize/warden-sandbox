@@ -94,7 +94,14 @@ export function scanPackage(
   const typosquatOf         = detectTyposquat(name);
 
   if (cachedEntry && cachedEntry.contentHash === contentHash) {
-    return cachedEntry.result;
+    // The expensive part (AST-scanning every file for capabilities) is skipped —
+    // that's the whole point of the cache. But typosquatOf/lifecycleScripts are
+    // cheap, name/metadata-derived checks that must stay current: otherwise a
+    // cached package silently keeps serving whatever verdict was computed the
+    // first time it was scanned, even after a warden upgrade changes the
+    // detection (e.g. a larger typosquat list) — exactly the case a cache
+    // should never cause a security check to go stale for.
+    return { ...cachedEntry.result, typosquatOf, lifecycleScripts };
   }
 
   const nativeBindings = hasNativeAddon(pkgDir);

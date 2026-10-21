@@ -79,13 +79,29 @@ export function mergeLockfile(
       continue;
     }
 
+    // A typosquat match that wasn't on the old entry — whether because the name just
+    // started matching (warden's typosquat list grew) or because the lockfile predates
+    // typosquat detection entirely — must force re-review. Checked independently of
+    // the content-hash branch below: the deceptive part of a typosquat is the package
+    // NAME, which doesn't require any code change to newly "become" a problem for an
+    // already-approved entry.
+    const newTyposquat = Boolean(newEntry.typosquatOf) && newEntry.typosquatOf !== oldEntry.typosquatOf;
+
     if (oldEntry.contentHash === newEntry.contentHash) {
-      // Content unchanged: preserve user policy overrides, status, and note
+      // Content unchanged: preserve user policy overrides, status, and note —
+      // unless a new typosquat flag appeared, which forces re-review regardless.
+      const status    = newTyposquat && oldEntry.status !== 'unsandboxed' ? 'pending-review' : oldEntry.status;
+      const note       = newTyposquat
+        ? `Package name is a likely typosquat of "${newEntry.typosquatOf}" — re-review required.`
+        : oldEntry.note;
+
       merged[key] = {
         ...newEntry,
-        status: oldEntry.status,
-        note: oldEntry.note,
-        ...(oldEntry.allowedCapabilities ? { allowedCapabilities: oldEntry.allowedCapabilities } : {}),
+        status,
+        note,
+        // Dropped when a new typosquat flag forces re-review: the previous narrow
+        // approval was granted without knowing about it.
+        ...(oldEntry.allowedCapabilities && !newTyposquat ? { allowedCapabilities: oldEntry.allowedCapabilities } : {}),
         ...(oldEntry.deniedCapabilities  ? { deniedCapabilities:  oldEntry.deniedCapabilities  } : {}),
       };
       continue;
@@ -94,19 +110,22 @@ export function mergeLockfile(
     // Content changed: detect new capabilities and downgrade status
     const oldCaps      = new Set(oldEntry.capabilities);
     const addedCaps    = newEntry.capabilities.filter(c => !oldCaps.has(c));
+    const forceReview  = addedCaps.length > 0 || newTyposquat;
 
     let note: string | undefined;
     if (addedCaps.length > 0) {
       note = `New capabilities detected after update: ${addedCaps.join(', ')}. Previously approved as: [${oldEntry.capabilities.join(', ') || 'none'}].`;
+    } else if (newTyposquat) {
+      note = `Package name is a likely typosquat of "${newEntry.typosquatOf}" — re-review required.`;
     } else if (oldEntry.status === 'approved') {
       note = 'Content hash changed (code modified). Re-review recommended.';
     }
 
     merged[key] = {
       ...newEntry,
-      status: addedCaps.length > 0 || newEntry.status === 'unsandboxed'
-        ? newEntry.status === 'unsandboxed' ? 'unsandboxed' : 'pending-review'
-        : oldEntry.status,
+      status: newEntry.status === 'unsandboxed'
+        ? 'unsandboxed'
+        : forceReview ? 'pending-review' : oldEntry.status,
       note,
       // allowedCapabilities is intentionally dropped on content change (capabilities may differ).
       // deniedCapabilities is preserved — the user's explicit deny intent remains valid.

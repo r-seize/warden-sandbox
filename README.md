@@ -790,6 +790,8 @@ warden run --enforce --profile lenient script.js
 
 Warden maintains a shared scan cache at `~/.warden/cache/`. After a package has been scanned once on your machine, subsequent scans of the same version (by content hash) are instant regardless of which project you are scanning. The local project lockfile cache is also used as a first-level cache, with the global cache as a fallback.
 
+A cache hit skips the expensive AST scan (the capabilities it already found are reused as-is), but name/metadata-derived checks — the typosquat match and declared life-cycle scripts — are always recomputed, even on a cache hit. This matters after upgrading Warden to a version with a larger typosquat list, or one with detection the lockfile predates: the next scan still catches it, rather than silently continuing to serve whatever verdict was cached the first time.
+
 To disable the global cache for a single run, you can clear the directory:
 
 ```bash
@@ -819,6 +821,8 @@ Warden's hooks only exist once a script `require`s/`import`s a package — they 
 ### The typosquat list is small, static, and offline
 
 `warden scan` flags package names that are a one-character edit away from a name in a small, bundled list of popular packages. It is not a registry lookup and does not grow over time on its own — it only catches typos of the packages already in that list, and it intentionally ignores scoped packages (`@scope/name`) and anything more than one character off, to keep false positives low.
+
+A typosquat match forces a package back to `pending-review` — including an already-`approved`, content-unchanged entry, and including one in a lockfile written before Warden had typosquat detection at all — and `warden verify`/`warden ci` fail on it, not just `warden scan`'s terminal output. Approving it again (`warden approve`) is a one-time, explicit dismissal: once a lockfile entry records the same `typosquatOf` value, re-scanning it won't re-flag it. It only flags again if the match changes (e.g. a future, larger typosquat list matches a *different* popular package).
 
 ### Observation mode never blocks
 

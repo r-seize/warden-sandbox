@@ -82,6 +82,56 @@ describe('scanPackage — life-cycle script detection', () => {
   });
 });
 
+describe('scanPackage — cache hits refresh name/metadata-derived fields', () => {
+  it('recomputes typosquatOf on a cache hit, even though the cached result predates detection', () => {
+    const dir = makeTmpDir();
+    writePackage(dir, 'lodahs', '1.0.0');
+
+    const fresh = scanPackage(dir);
+    expect(fresh.contentHash).toBeTruthy();
+
+    // Simulate a cache entry written by a warden version that didn't have
+    // typosquat detection yet (or had a smaller list) — same content hash,
+    // but a stale/absent typosquatOf baked into the cached result.
+    const staleCachedEntry = {
+      contentHash: fresh.contentHash,
+      result: { ...fresh, typosquatOf: null },
+    };
+
+    const rescanned = scanPackage(dir, staleCachedEntry);
+    expect(rescanned.contentHash).toBe(fresh.contentHash); // cache hit, not a full rescan
+    expect(rescanned.typosquatOf).toBe('lodash'); // but the stale verdict was refreshed
+  });
+
+  it('recomputes lifecycleScripts on a cache hit', () => {
+    const dir = makeTmpDir();
+    writePackage(dir, 'has-scripts', '1.0.0', { scripts: { postinstall: 'node setup.js' } });
+
+    const fresh = scanPackage(dir);
+    const staleCachedEntry = {
+      contentHash: fresh.contentHash,
+      result: { ...fresh, lifecycleScripts: [] },
+    };
+
+    const rescanned = scanPackage(dir, staleCachedEntry);
+    expect(rescanned.contentHash).toBe(fresh.contentHash);
+    expect(rescanned.lifecycleScripts).toEqual(['postinstall']);
+  });
+
+  it('still skips the expensive AST scan on a cache hit (capabilities come from the cache)', () => {
+    const dir = makeTmpDir();
+    // Real source would trigger 'network', but the cached result says otherwise —
+    // a cache hit must still trust the cache for capabilities (that's the point
+    // of the cache); only typosquatOf/lifecycleScripts are refreshed.
+    writePackage(dir, 'clean-pkg', '1.0.0', {}, "require('http');\n");
+    const fresh = scanPackage(dir);
+
+    const cachedEntry = { contentHash: fresh.contentHash, result: { ...fresh, capabilities: [] } };
+    const rescanned    = scanPackage(dir, cachedEntry);
+    expect(rescanned.capabilities).toEqual([]);
+  });
+});
+
 describe('discoverScanTargets — workspace / monorepo support', () => {
   it('returns only the root when there are no workspaces', () => {
     const project = makeTmpDir();
