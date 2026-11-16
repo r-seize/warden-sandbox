@@ -107,11 +107,31 @@ export function printScanSummary(results: PackageScanResult[]): void {
     console.log('');
   }
 
+  const riskyLifecycleScripts = results.filter(r => r.lifecycleScriptRisks.length > 0);
+  if (riskyLifecycleScripts.length > 0) {
+    console.log(chalk.bgRed.white(' WARNING ') + chalk.bold(' Life-cycle scripts matching known risk patterns:'));
+    for (const r of riskyLifecycleScripts) {
+      console.log(`  ${chalk.red('-')} ${r.name}@${r.version}`);
+      for (const risk of r.lifecycleScriptRisks) console.log(`      ${chalk.dim(risk)}`);
+    }
+    console.log('');
+  }
+
   const possibleTyposquats = results.filter(r => r.typosquatOf);
   if (possibleTyposquats.length > 0) {
     console.log(chalk.bgRed.white(' WARNING ') + chalk.bold(' Possible typosquats — verify these are the packages you meant to install:'));
     for (const r of possibleTyposquats) {
       console.log(`  ${chalk.red('-')} ${r.name}@${r.version}  ${chalk.dim(`(looks like "${r.typosquatOf}")`)}`);
+    }
+    console.log('');
+  }
+
+  const withEvasionPatterns = results.filter(r => r.evasionPatterns.length > 0);
+  if (withEvasionPatterns.length > 0) {
+    console.log(chalk.bgRed.white(' WARNING ') + chalk.bold(' Code matches known evasion/obfuscation patterns:'));
+    for (const r of withEvasionPatterns) {
+      console.log(`  ${chalk.red('-')} ${r.name}@${r.version}`);
+      for (const pattern of r.evasionPatterns) console.log(`      ${chalk.dim(pattern)}`);
     }
     console.log('');
   }
@@ -354,11 +374,31 @@ export function printAudit(lock: LockfileData): void {
     console.log('');
   }
 
+  const riskyLifecycleScripts = entries.filter(([, p]) => (p.lifecycleScriptRisks?.length ?? 0) > 0);
+  if (riskyLifecycleScripts.length > 0) {
+    console.log(chalk.red.bold(`  LIFE-CYCLE SCRIPT RISK PATTERNS`));
+    for (const [key, p] of riskyLifecycleScripts) {
+      console.log(`    ${key}`);
+      for (const risk of p.lifecycleScriptRisks ?? []) console.log(`      ${chalk.red('[RISK]')} ${chalk.dim(risk)}`);
+    }
+    console.log('');
+  }
+
   const possibleTyposquats = entries.filter(([, p]) => p.typosquatOf);
   if (possibleTyposquats.length > 0) {
     console.log(chalk.red.bold(`  POSSIBLE TYPOSQUATS`));
     for (const [key, p] of possibleTyposquats) {
       console.log(`    ${chalk.red(`[TYPOSQUAT] looks like "${p.typosquatOf}"`.padEnd(40))}  ${key}`);
+    }
+    console.log('');
+  }
+
+  const withEvasionPatterns = entries.filter(([, p]) => (p.evasionPatterns?.length ?? 0) > 0);
+  if (withEvasionPatterns.length > 0) {
+    console.log(chalk.red.bold(`  EVASION / OBFUSCATION PATTERNS`));
+    for (const [key, p] of withEvasionPatterns) {
+      console.log(`    ${key}`);
+      for (const pattern of p.evasionPatterns ?? []) console.log(`      ${chalk.red('[EVASION]')} ${chalk.dim(pattern)}`);
     }
     console.log('');
   }
@@ -530,6 +570,34 @@ export function generateMarkdownReport(lock: LockfileData): string {
     lines.push('');
   }
 
+  const riskyLifecycleScripts = entries.filter(([, p]) => (p.lifecycleScriptRisks?.length ?? 0) > 0);
+  if (riskyLifecycleScripts.length > 0) {
+    lines.push('## Life-Cycle Script Risk Patterns');
+    lines.push('');
+    lines.push('Static pattern matches only — not proof of malicious behaviour, but worth reviewing.');
+    lines.push('');
+    lines.push('| Package | Risk Patterns |');
+    lines.push('|---|---|');
+    for (const [key, p] of riskyLifecycleScripts) {
+      lines.push(`| ${key} | ${(p.lifecycleScriptRisks ?? []).join('; ')} |`);
+    }
+    lines.push('');
+  }
+
+  const withEvasionPatterns = entries.filter(([, p]) => (p.evasionPatterns?.length ?? 0) > 0);
+  if (withEvasionPatterns.length > 0) {
+    lines.push('## Evasion / Obfuscation Patterns');
+    lines.push('');
+    lines.push('Static pattern matches only — not proof of malicious behaviour, but worth reviewing.');
+    lines.push('');
+    lines.push('| Package | Patterns |');
+    lines.push('|---|---|');
+    for (const [key, p] of withEvasionPatterns) {
+      lines.push(`| ${key} | ${(p.evasionPatterns ?? []).join('; ')} |`);
+    }
+    lines.push('');
+  }
+
   lines.push('## Capability Breakdown');
   lines.push('');
   lines.push('| Capability | Package Count |');
@@ -549,6 +617,8 @@ export function generateMarkdownReport(lock: LockfileData): string {
 function violationRuleId(violation: string): string {
   if (violation.includes('not in lockfile')) return 'WARDEN004';
   if (violation.includes('typosquat')) return 'WARDEN005';
+  if (violation.includes('evasion pattern')) return 'WARDEN007';
+  if (violation.includes('risk pattern')) return 'WARDEN006';
   if (violation.includes('content hash')) return 'WARDEN001';
   if (violation.includes('new capabilities')) return 'WARDEN002';
   return 'WARDEN003';
@@ -630,6 +700,8 @@ export function generateSarifReport(violations: string[]): object {
             { id: 'WARDEN003', name: 'PendingReview', shortDescription: { text: 'Package not yet approved' } },
             { id: 'WARDEN004', name: 'NotInLockfile', shortDescription: { text: 'Package not registered in lockfile' } },
             { id: 'WARDEN005', name: 'TyposquatDetected', shortDescription: { text: 'Package name is a likely typosquat of a popular package' } },
+            { id: 'WARDEN006', name: 'LifecycleScriptRisk', shortDescription: { text: 'Life-cycle script matches a known risk pattern' } },
+            { id: 'WARDEN007', name: 'EvasionPatternDetected', shortDescription: { text: 'Code matches a known evasion/obfuscation idiom' } },
           ],
         },
       },

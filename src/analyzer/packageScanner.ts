@@ -2,9 +2,10 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { Capability } from './capabilityMap';
-import { scanFile, scanFileHeuristic } from './astScanner';
+import { scanFile, scanFileHeuristic, scanFileHeuristicEvasion } from './astScanner';
 import { collectJsFiles, hasNativeAddon, isDirEntry } from './fileUtils';
-import { detectTyposquat } from './typosquat';
+import { detectTyposquat, TyposquatOptions } from './typosquat';
+import { analyzeLifecycleScriptRisk } from './scriptRisk';
 import type { WorkerInput, WorkerMessage } from './scanWorker';
 
 export interface PackageScanResult {
@@ -19,8 +20,14 @@ export interface PackageScanResult {
   /** npm life-cycle script names ('preinstall' | 'install' | 'postinstall') the package declares.
    *  These run at install time, outside Warden's load-time sandboxing — surfaced for visibility only. */
   lifecycleScripts: string[];
+  /** Static risk-pattern labels matched across all declared life-cycle script commands
+   *  (curl/wget, base64, chmod +x, piping into a shell, ...). See scriptRisk.ts. */
+  lifecycleScriptRisks: string[];
   /** Set when the package name is a likely one-character typo of a popular package (see typosquat.ts). */
   typosquatOf: string | null;
+  /** Static code-obfuscation idioms found in the package's JS (base64-decoded strings
+   *  feeding a call, indirect Function constructor access). See astEngine.ts. */
+  evasionPatterns: string[];
 }
 
 export interface ScanCacheEntry {
@@ -76,6 +83,16 @@ function detectLifecycleScripts(pkgJson: PackageJsonMeta): string[] {
   return LIFECYCLE_SCRIPT_NAMES.filter(name => typeof scripts[name] === 'string' && scripts[name].trim().length > 0);
 }
 
+/** Static risk-pattern labels matched across all of the package's declared life-cycle scripts. */
+function detectLifecycleScriptRisks(pkgJson: PackageJsonMeta, lifecycleScripts: string[]): string[] {
+  const scripts    = pkgJson.scripts ?? {};
+  const matched    = new Set<string>();
+  for (const name of lifecycleScripts) {
+    for (const risk of analyzeLifecycleScriptRisk(scripts[name] ?? '')) matched.add(risk);
+  }
+  return [...matched];
+}
+
 /**
  * Scan a single package directory and return its capability profile.
  * Returns the cached result immediately when the content hash matches.
@@ -83,15 +100,17 @@ function detectLifecycleScripts(pkgJson: PackageJsonMeta): string[] {
 export function scanPackage(
   pkgDir: string,
   cachedEntry?: ScanCacheEntry,
+  typosquatOptions?: TyposquatOptions,
 ): PackageScanResult {
   const pkgJson    = readPackageJson(pkgDir);
   const name       = pkgJson.name ?? path.basename(pkgDir);
   const version    = pkgJson.version ?? 'unknown';
 
-  const jsFiles             = collectJsFiles(pkgDir);
-  const contentHash         = hashDir(jsFiles);
-  const lifecycleScripts    = detectLifecycleScripts(pkgJson);
-  const typosquatOf         = detectTyposquat(name);
+  const jsFiles                 = collectJsFiles(pkgDir);
+  const contentHash             = hashDir(jsFiles);
+  const lifecycleScripts        = detectLifecycleScripts(pkgJson);
+  const lifecycleScriptRisks    = detectLifecycleScriptRisks(pkgJson, lifecycleScripts);
+  const typosquatOf             = detectTyposquat(name, typosquatOptions);
 
   if (cachedEntry && cachedEntry.contentHash === contentHash) {
     // The expensive part (AST-scanning every file for capabilities) is skipped —
@@ -101,7 +120,7 @@ export function scanPackage(
     // first time it was scanned, even after a warden upgrade changes the
     // detection (e.g. a larger typosquat list) — exactly the case a cache
     // should never cause a security check to go stale for.
-    return { ...cachedEntry.result, typosquatOf, lifecycleScripts };
+    return { ...cachedEntry.result, typosquatOf, lifecycleScripts, lifecycleScriptRisks };
   }
 
   const nativeBindings = hasNativeAddon(pkgDir);
@@ -116,11 +135,14 @@ export function scanPackage(
       unanalyzableFiles: [],
       fileCount: jsFiles.length,
       lifecycleScripts,
+      lifecycleScriptRisks,
       typosquatOf,
+      evasionPatterns: [],
     };
   }
 
   const allCapabilities                = new Set<Capability>();
+  const allEvasionPatterns             = new Set<string>();
   const unanalyzableFiles: string[]    = [];
 
   for (const file of jsFiles) {
@@ -130,6 +152,7 @@ export function scanPackage(
       if (stat.size > MAX_FILE_SIZE) {
         const raw = fs.readFileSync(file, 'utf8');
         for (const cap of scanFileHeuristic(raw)) allCapabilities.add(cap);
+        for (const pattern of scanFileHeuristicEvasion(raw)) allEvasionPatterns.add(pattern);
         unanalyzableFiles.push(path.relative(pkgDir, file) + ' (oversized)');
         continue;
       }
@@ -142,9 +165,11 @@ export function scanPackage(
     const fileResult = scanFile(source);
     if (fileResult.unanalyzable) {
       for (const cap of scanFileHeuristic(source)) allCapabilities.add(cap);
+      for (const pattern of scanFileHeuristicEvasion(source)) allEvasionPatterns.add(pattern);
       unanalyzableFiles.push(path.relative(pkgDir, file));
     } else {
       for (const cap of fileResult.capabilities) allCapabilities.add(cap);
+      for (const pattern of fileResult.evasionPatterns) allEvasionPatterns.add(pattern);
     }
   }
 
@@ -160,8 +185,10 @@ export function scanPackage(
       : 'scanned',
     hasNativeBindings: false,
     unanalyzableFiles,
+    evasionPatterns: [...allEvasionPatterns],
     fileCount: jsFiles.length,
     lifecycleScripts,
+    lifecycleScriptRisks,
     typosquatOf,
   };
 }
@@ -217,6 +244,7 @@ async function scanWithWorkers(
   useGlobalCache: boolean,
   results: PackageScanResult[],
   onPackageDone: (name: string, cached: boolean, timeMs: number, fileCount: number) => void,
+  typosquatOptions?: TyposquatOptions,
 ): Promise<boolean> {
   const workerPath = path.join(__dirname, 'scanWorker.js');
   if (!fs.existsSync(workerPath)) return false;
@@ -248,6 +276,7 @@ async function scanWithWorkers(
       const input: WorkerInput = {
         pkgDirs: chunk.pkgDirs,
         cacheEntries: chunk.cacheEntries,
+        typosquatOptions,
       };
       const worker = new Worker(workerPath, { workerData: input });
 
@@ -284,6 +313,7 @@ export async function scanNodeModules(
   onProgress?: (done: number, total: number, pkgName: string) => void,
   useGlobalCache = true,
   onVerbose?: (info: VerboseInfo) => void,
+  typosquatOptions?: TyposquatOptions,
 ): Promise<PackageScanResult[]> {
   const globalCache = useGlobalCache ? loadGlobalCache() : new Map<string, ScanCacheEntry>();
 
@@ -298,7 +328,7 @@ export async function scanNodeModules(
   };
 
   const usedWorkers = await scanWithWorkers(
-    packages, cache, globalCache, useGlobalCache, results, onPackageDone,
+    packages, cache, globalCache, useGlobalCache, results, onPackageDone, typosquatOptions,
   );
 
   if (!usedWorkers) {
@@ -313,7 +343,7 @@ export async function scanNodeModules(
 
       const t0            = Date.now();
       const isCacheHit    = cachedEntry !== undefined;
-      const result        = scanPackage(pkgDir, cachedEntry);
+      const result        = scanPackage(pkgDir, cachedEntry, typosquatOptions);
       const timeMs        = Date.now() - t0;
       results[i]          = result;
 
@@ -341,16 +371,17 @@ export async function scanProject(
   onProgress?: (done: number, total: number, pkgName: string) => void,
   useGlobalCache = true,
   onVerbose?: (info: VerboseInfo) => void,
+  typosquatOptions?: TyposquatOptions,
 ): Promise<PackageScanResult[]> {
   const targets = discoverScanTargets(projectDir);
   if (targets.length <= 1) {
     const nodeModulesDir = targets[0]?.nodeModulesDir ?? path.join(projectDir, 'node_modules');
-    return scanNodeModules(nodeModulesDir, cache, onProgress, useGlobalCache, onVerbose);
+    return scanNodeModules(nodeModulesDir, cache, onProgress, useGlobalCache, onVerbose, typosquatOptions);
   }
 
   const merged    = new Map<string, PackageScanResult>();
   for (const target of targets) {
-    const results = await scanNodeModules(target.nodeModulesDir, cache, onProgress, useGlobalCache, onVerbose);
+    const results = await scanNodeModules(target.nodeModulesDir, cache, onProgress, useGlobalCache, onVerbose, typosquatOptions);
     for (const result of results) {
       const key = `${result.name}@${result.version}`;
       if (!merged.has(key)) merged.set(key, result);

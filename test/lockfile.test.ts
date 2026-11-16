@@ -61,6 +61,47 @@ describe('mergeLockfile — typosquat forces re-review', () => {
     expect(merged.packages['lodahs@1.0.0'].allowedCapabilities).toBeUndefined();
   });
 
+  it('downgrades an already-approved package when a new life-cycle script risk pattern appears', () => {
+    const old = existingLock({
+      'risky-pkg@1.0.0': { contentHash: 'sha256:abc', capabilities: [], status: 'approved', lifecycleScripts: ['postinstall'] },
+    });
+    const fresh: Record<string, PackagePolicy> = {
+      'risky-pkg@1.0.0': {
+        contentHash: 'sha256:abc',
+        capabilities: [],
+        status: 'approved',
+        lifecycleScripts: ['postinstall'],
+        lifecycleScriptRisks: ['downloads over the network (curl)'],
+      },
+    };
+
+    const merged = mergeLockfile(old, fresh);
+    expect(merged.packages['risky-pkg@1.0.0'].status).toBe('pending-review');
+    expect(merged.packages['risky-pkg@1.0.0'].note).toMatch(/risk pattern/i);
+  });
+
+  it('does not re-flag a risk pattern already recorded on the old entry', () => {
+    const old = existingLock({
+      'risky-pkg@1.0.0': {
+        contentHash: 'sha256:abc',
+        capabilities: [],
+        status: 'approved',
+        lifecycleScriptRisks: ['downloads over the network (curl)'],
+      },
+    });
+    const fresh: Record<string, PackagePolicy> = {
+      'risky-pkg@1.0.0': {
+        contentHash: 'sha256:abc',
+        capabilities: [],
+        status: 'approved',
+        lifecycleScriptRisks: ['downloads over the network (curl)'],
+      },
+    };
+
+    const merged = mergeLockfile(old, fresh);
+    expect(merged.packages['risky-pkg@1.0.0'].status).toBe('approved');
+  });
+
   it('never un-downgrades a native-addon package (unsandboxed stays unsandboxed)', () => {
     const old = existingLock({
       'native-lib@1.0.0': { contentHash: 'sha256:abc', capabilities: ['native-binding'], status: 'unsandboxed' },

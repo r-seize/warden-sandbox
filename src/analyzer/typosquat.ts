@@ -74,20 +74,30 @@ function editDistance(a: string, b: string, maxDistance: number): number {
   return d[a.length][b.length];
 }
 
-const MIN_NAME_LENGTH    = 4; // skip very short names ("fs", "ms") — too noisy
-const MAX_EDIT_DISTANCE  = 1;
+const MIN_NAME_LENGTH           = 4; // skip very short names ("fs", "ms") — too noisy
+const DEFAULT_MAX_EDIT_DISTANCE = 1;
+
+export interface TyposquatOptions {
+  /** Package names to never flag, regardless of edit distance (from `.wardenrc.json`'s `typosquatAllowlist`). */
+  allowlist?: Set<string>;
+  /** Maximum edit distance to flag, default 1. Raising this trades precision for recall. */
+  maxDistance?: number;
+}
 
 /**
- * Check whether `pkgName` looks like a one-character typo of a popular package.
- * Returns the popular package name it may be squatting on, or null.
+ * Check whether `pkgName` looks like a one-character (or `maxDistance`) typo of
+ * a popular package. Returns the popular package name it may be squatting on, or null.
  */
-export function detectTyposquat(pkgName: string): string | null {
+export function detectTyposquat(pkgName: string, opts: TyposquatOptions = {}): string | null {
+  const maxDistance = opts.maxDistance ?? DEFAULT_MAX_EDIT_DISTANCE;
+
   if (pkgName.startsWith('@')) return null; // scoped packages not covered
   if (pkgName.length < MIN_NAME_LENGTH) return null;
   if (POPULAR_SET.has(pkgName)) return null; // exact match — not a typo of itself
+  if (opts.allowlist?.has(pkgName)) return null;
 
   for (const popular of POPULAR_PACKAGES) {
-    if (editDistance(pkgName, popular, MAX_EDIT_DISTANCE) <= MAX_EDIT_DISTANCE) {
+    if (editDistance(pkgName, popular, maxDistance) <= maxDistance) {
       return popular;
     }
   }

@@ -1,6 +1,6 @@
 {
   "name": "warden-sandbox",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Runtime capability sandboxing for Node.js dependencies",
   "type": "commonjs",
   "bin": {
@@ -25,7 +25,7 @@
     "supply-chain",
     "compartment"
   ],
-  "license": "BSD-2-Clause",
+  "license": "BSD-3-Clause",
   "repository": {
     "type": "git",
     "url": "https://github.com/r-seize/warden-sandbox.git"

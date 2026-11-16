@@ -36,4 +36,15 @@ describe('detectTyposquat', () => {
     expect(detectTyposquat('ws')).toBeNull();
     expect(detectTyposquat('fs')).toBeNull();
   });
+
+  it('respects an allowlist, even for a name that would otherwise match', () => {
+    expect(detectTyposquat('lodahs', { allowlist: new Set(['lodahs']) })).toBeNull();
+    expect(detectTyposquat('lodahs')).toBe('lodash'); // unaffected without the allowlist
+  });
+
+  it('respects a configurable maxDistance', () => {
+    // 'xxdash' is 2 substitutions from 'lodash' — not caught at the default distance of 1.
+    expect(detectTyposquat('xxdash')).toBeNull();
+    expect(detectTyposquat('xxdash', { maxDistance: 2 })).toBe('lodash');
+  });
 });

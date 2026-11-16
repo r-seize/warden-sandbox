@@ -125,4 +125,36 @@ describe('warden ci', () => {
     expect(parsed.ok).toBe(true);
     expect(result.code).toBe(0);
   });
+
+  it('--strict fails on a declared life-cycle script that is otherwise allowed', () => {
+    const dir    = makeProject();
+    const nm     = path.join(dir, 'node_modules');
+    const pkgDir = path.join(nm, 'scripted-pkg');
+    fs.mkdirSync(pkgDir, { recursive: true });
+    fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({
+      name: 'scripted-pkg',
+      version: '1.0.0',
+      scripts: { postinstall: 'echo done' },
+    }));
+    fs.writeFileSync(path.join(pkgDir, 'index.js'), 'module.exports = {};\n');
+    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'ci-test' }));
+    writePackageLock(dir, { 'scripted-pkg': { version: '1.0.0' } });
+
+    expect(warden(dir, ['scan', '--no-progress']).code).toBe(0);
+    expect(warden(dir, ['approve', '--all']).code).toBe(0);
+
+    const plain = warden(dir, ['ci']);
+    expect(plain.code).toBe(0);
+
+    const strict = warden(dir, ['ci', '--strict']);
+    expect(strict.code).toBe(1);
+    expect(strict.stdout).toContain('scripted-pkg');
+
+    const strictJson = JSON.parse(warden(dir, ['ci', '--strict', '--json']).stdout) as {
+      ok: boolean;
+      strict: { ok: boolean; violations: string[] } | null;
+    };
+    expect(strictJson.ok).toBe(false);
+    expect(strictJson.strict?.violations.length).toBe(1);
+  });
 });

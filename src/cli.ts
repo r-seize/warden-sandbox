@@ -35,7 +35,11 @@ import {
   createProgressPrinter,
 } from './report/cliReport';
 import chalk from 'chalk';
-import { readConfig, isIgnored } from './config';
+import { readConfig, isIgnored, WardenConfig } from './config';
+import { TyposquatOptions } from './analyzer/typosquat';
+import { parseYarnLockfile, parsePnpmLockfile, LockfileIntegrityEntry, LockfileKind } from './analyzer/lockfileParsers';
+import { analyzeLifecycleScriptRisk } from './analyzer/scriptRisk';
+import { parseApproveChoice, applyApproveChoice } from './policy/approveChoice';
 import { explainPackage } from './analyzer/explainer';
 import { buildDepGraph } from './analyzer/depGraph';
 import { recommendConfig } from './policy/policyGenerator';
@@ -67,8 +71,9 @@ program
     }
 
     // Load existing lockfile to use as scan cache
-    const existing    = readLockfile(projectDir);
-    const cache       = buildCacheFromLockfile(existing);
+    const existing            = readLockfile(projectDir);
+    const cache               = buildCacheFromLockfile(existing);
+    const typosquatOptions    = buildTyposquatOptions(readConfig(projectDir));
 
     if (!opts.json) {
       console.log(chalk.bold(`\nWarden scan — ${projectDir}`));
@@ -91,6 +96,7 @@ program
       progressPrinter,
       true,
       onVerbose,
+      typosquatOptions,
     );
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -176,7 +182,7 @@ program
       }
       const cache = buildCacheFromLockfile(oldLock);
       console.log(chalk.bold('\nWarden — scanning node_modules for diff...'));
-      const results        = await scanProject(projectDir, cache, (d, t, p) => printProgress(d, t, p));
+      const results        = await scanProject(projectDir, cache, (d, t, p) => printProgress(d, t, p), true, undefined, buildTyposquatOptions(readConfig(projectDir)));
       const newPolicies    = buildPolicyMap(results);
       newLock              = mergeLockfile(null, newPolicies);
     }
@@ -211,13 +217,13 @@ program
       process.exit(2);
     }
 
+    const config         = readConfig(projectDir);
     const cache          = buildCacheFromLockfile(existing);
     const machineOutput  = opts.json || opts.sarif || opts.junit;
     if (!machineOutput) console.log(chalk.bold('\nWarden verify — scanning node_modules...'));
-    const results        = await scanProject(projectDir, cache, machineOutput ? undefined : (d, t, p) => printProgress(d, t, p));
+    const results        = await scanProject(projectDir, cache, machineOutput ? undefined : (d, t, p) => printProgress(d, t, p), true, undefined, buildTyposquatOptions(config));
     const newPolicies    = buildPolicyMap(results);
 
-    const config                  = readConfig(projectDir);
     const ignoreList              = config.ignore ?? [];
     const violations: string[]    = [];
 
@@ -237,6 +243,20 @@ program
       // typosquat list, or one that didn't have this detection at all).
       if (newPolicy.typosquatOf && newPolicy.typosquatOf !== lockedPolicy.typosquatOf) {
         violations.push(`${key}: package name is a likely typosquat of "${newPolicy.typosquatOf}" — re-review required`);
+      }
+
+      const newRiskyScripts = (newPolicy.lifecycleScriptRisks ?? []).filter(
+        r => !(lockedPolicy.lifecycleScriptRisks ?? []).includes(r),
+      );
+      if (newRiskyScripts.length > 0) {
+        violations.push(`${key}: life-cycle script matches risk pattern(s): ${newRiskyScripts.join('; ')} — re-review required`);
+      }
+
+      const newEvasionPatterns = (newPolicy.evasionPatterns ?? []).filter(
+        p => !(lockedPolicy.evasionPatterns ?? []).includes(p),
+      );
+      if (newEvasionPatterns.length > 0) {
+        violations.push(`${key}: code matches evasion pattern(s): ${newEvasionPatterns.join('; ')} — re-review required`);
       }
 
       if (lockedPolicy.contentHash !== newPolicy.contentHash) {
@@ -292,7 +312,8 @@ program
   )
   .option('--note <text>', 'Add a human-readable note to the approval (stored in warden.lock.json)')
   .option('--deny <cap>', 'Explicitly deny a specific capability (complement of --capability): package will be blocked from this capability even if it declared it')
-  .action(async (pkgArgs: string[], opts: { dir: string; all: boolean; rescan: boolean; capability?: string; note?: string; deny?: string }) => {
+  .option('-i, --interactive', 'Walk through each package one at a time, showing the evidence behind its capabilities before deciding')
+  .action(async (pkgArgs: string[], opts: { dir: string; all: boolean; rescan: boolean; capability?: string; note?: string; deny?: string; interactive: boolean }) => {
     const projectDir = path.resolve(opts.dir);
 
     const VALID_CAPS = new Set(['network', 'process-spawn', 'dynamic-code', 'native-binding', 'filesystem-write', 'env-access', 'filesystem-read']);
@@ -313,19 +334,20 @@ program
       process.exit(2);
     }
 
-    if (!opts.all && pkgArgs.length === 0) {
+    if (!opts.all && !opts.interactive && pkgArgs.length === 0) {
       console.error(chalk.red('Error: Specify package name(s) or use --all.'));
       console.error(chalk.dim('  Examples:'));
       console.error(chalk.dim('    warden approve axios'));
       console.error(chalk.dim('    warden approve axios lodash debug'));
       console.error(chalk.dim('    warden approve --all'));
+      console.error(chalk.dim('    warden approve --interactive'));
       process.exit(2);
     }
 
     // Determine which lockfile keys to approve
     let keysToApprove: string[];
 
-    if (opts.all) {
+    if (opts.all || (opts.interactive && pkgArgs.length === 0)) {
       keysToApprove = Object.entries(lockfile.packages)
         .filter(([, p]) => p.status === 'pending-review')
         .map(([k]) => k);
@@ -364,7 +386,7 @@ program
         const { scanProject: rescanProject }    = await import('./analyzer/packageScanner') as typeof import('./analyzer/packageScanner');
         const { buildPolicyMap }                = await import('./policy/policyGenerator') as typeof import('./policy/policyGenerator');
         const cache                              = buildCacheFromLockfile(lockfile);
-        const results                            = await rescanProject(projectDir, cache);
+        const results                            = await rescanProject(projectDir, cache, undefined, true, undefined, buildTyposquatOptions(readConfig(projectDir)));
         const fresh                  = buildPolicyMap(results);
         // Update capabilities from fresh scan (but don't overwrite status yet)
         for (const [key, newPol] of Object.entries(fresh)) {
@@ -374,6 +396,84 @@ program
           }
         }
       }
+    }
+
+    if (opts.interactive) {
+      const nodeModulesDir    = path.join(projectDir, 'node_modules');
+      const readline           = await import('node:readline');
+      const rl                 = readline.createInterface({ input: process.stdin, output: process.stdout });
+      const ask = (q: string): Promise<string> =>
+        new Promise(resolve => rl.question(q, answer => resolve(answer.trim())));
+
+      let changed    = 0;
+      let quit        = false;
+
+      for (const key of keysToApprove) {
+        if (quit) break;
+        const entry = lockfile.packages[key];
+        if (!entry) continue;
+
+        if (entry.status === 'unsandboxed') {
+          console.log(chalk.yellow(`\n  !  Skipping ${chalk.bold(key)} `) + chalk.dim('(native .node addon — cannot be sandboxed)'));
+          continue;
+        }
+
+        const pkgName = key.slice(0, key.lastIndexOf('@'));
+
+        console.log('');
+        console.log(chalk.bold.underline(key));
+        console.log(`  Status: ${entry.status}   Capabilities: ${entry.capabilities.join(', ') || 'none'}`);
+        if (entry.note) console.log(chalk.dim(`  Note: ${entry.note}`));
+
+        if (entry.capabilities.length > 0) {
+          const explanation = explainPackage(nodeModulesDir, pkgName);
+          if (explanation.evidence.length > 0) {
+            console.log(chalk.dim('  Evidence:'));
+            for (const ev of explanation.evidence.slice(0, 8)) {
+              console.log(`    ${chalk.dim(`[${ev.capability}]`)} ${ev.file}:${ev.line}  ${chalk.dim(ev.snippet)}`);
+            }
+            if (explanation.evidence.length > 8) {
+              console.log(chalk.dim(`    ... and ${explanation.evidence.length - 8} more (run \`warden explain ${pkgName}\` for all)`));
+            }
+          }
+        }
+
+        const rawChoice    = await ask(chalk.bold(
+          '  [a]llow all / [d]eny a capability / [r]estrict to a capability / [s]kip / [q]uit: ',
+        ));
+        const choice       = parseApproveChoice(rawChoice);
+
+        if (choice === 'quit') { quit = true; break; }
+
+        let capAnswer: string | undefined;
+        if (choice === 'deny' || choice === 'restrict') {
+          capAnswer = await ask(`  Capability to ${choice === 'deny' ? 'deny' : 'restrict to'} (${entry.capabilities.join(', ') || 'none'}): `);
+        }
+
+        const noteAnswer = choice === 'allow' || choice === 'deny' || choice === 'restrict'
+          ? await ask('  Note (optional, press enter to skip): ')
+          : undefined;
+
+        const result = applyApproveChoice(entry, choice, capAnswer, noteAnswer, VALID_CAPS);
+
+        if (result.changed) {
+          changed++;
+          console.log(chalk.green(`  + ${key} ${result.message}`));
+        } else {
+          console.log(chalk.dim(`  ${result.message}`));
+        }
+      }
+
+      rl.close();
+
+      if (changed > 0) {
+        lockfile.generatedAt = new Date().toISOString();
+        writeLockfile(projectDir, lockfile);
+        console.log(chalk.green(`\n  ${changed} package(s) approved — ${LOCKFILE_NAME} updated.`));
+      } else {
+        console.log(chalk.dim('\n  No changes made.'));
+      }
+      return;
     }
 
     console.log('');
@@ -690,11 +790,20 @@ function buildCacheFromLockfile(lock: LockfileData | null): Map<string, ScanCach
         unanalyzableFiles: [],
         fileCount: 0,
         lifecycleScripts: policy.lifecycleScripts ?? [],
+        lifecycleScriptRisks: policy.lifecycleScriptRisks ?? [],
         typosquatOf: policy.typosquatOf ?? null,
+        evasionPatterns: policy.evasionPatterns ?? [],
       },
     });
   }
   return cache;
+}
+
+function buildTyposquatOptions(config: WardenConfig): TyposquatOptions {
+  return {
+    allowlist: config.typosquatAllowlist ? new Set(config.typosquatAllowlist) : undefined,
+    maxDistance: config.typosquatMaxDistance,
+  };
 }
 
 function detectPackageManager(projectDir: string): 'npm' | 'pnpm' | 'yarn' {
@@ -742,15 +851,29 @@ program
 
     if (opts.json) {
       const byCapability: Record<string, string[]> = {};
+      const lifecycleScriptPackages: string[]       = [];
+      const unsandboxedPackages: string[]           = [];
+      const typosquatPackages: string[]             = [];
+      const evasionPackages: string[]                = [];
+
       for (const [key, policy] of Object.entries(lockfile.packages)) {
         for (const cap of policy.capabilities) {
           if (!byCapability[cap]) byCapability[cap] = [];
           byCapability[cap].push(key);
         }
+        if ((policy.lifecycleScripts?.length ?? 0) > 0) lifecycleScriptPackages.push(key);
+        if (policy.status === 'unsandboxed') unsandboxedPackages.push(key);
+        if (policy.typosquatOf) typosquatPackages.push(key);
+        if ((policy.evasionPatterns?.length ?? 0) > 0) evasionPackages.push(key);
       }
+
       console.log(JSON.stringify({
         total: Object.keys(lockfile.packages).length,
         byCapability,
+        lifecycleScriptPackages,
+        unsandboxedPackages,
+        typosquatPackages,
+        evasionPackages,
       }, null, 2));
     } else {
       printAudit(lockfile);
@@ -760,9 +883,12 @@ program
       const LOW_RISK_ONLY = new Set(['env-access', 'filesystem-read']);
       const toFix = Object.entries(lockfile.packages).filter(([, p]) => {
         if (p.status !== 'pending-review') return false;
-        // A typosquat match is never "low-risk" regardless of declared capabilities —
-        // a zero-capability package otherwise passes `[].every(...)` vacuously.
+        // A typosquat match or a risky life-cycle script is never "low-risk" regardless
+        // of declared capabilities — a zero-capability package otherwise passes
+        // `[].every(...)` vacuously.
         if (p.typosquatOf) return false;
+        if ((p.lifecycleScriptRisks ?? []).length > 0) return false;
+        if ((p.evasionPatterns ?? []).length > 0) return false;
         return p.capabilities.every(c => LOW_RISK_ONLY.has(c));
       });
 
@@ -827,6 +953,9 @@ program
       projectDir,
       cache,
       (done, total, pkg) => printProgress(done, total, pkg),
+      true,
+      undefined,
+      buildTyposquatOptions(config),
     );
 
     const newPolicies    = buildPolicyMap(results);
@@ -904,6 +1033,9 @@ program
       projectDir,
       cache,
       (done, total, pkg) => printProgress(done, total, pkg),
+      true,
+      undefined,
+      buildTyposquatOptions(config),
     );
 
     const newPolicies    = buildPolicyMap(results);
@@ -1050,6 +1182,13 @@ program
       const match = NODE_FILE_SCRIPT_RE.exec(command);
       if (!match) {
         console.log(chalk.yellow('  Cannot be sandboxed automatically — not a direct `node <file>.js` invocation.'));
+        const risks = analyzeLifecycleScriptRisk(command);
+        if (risks.length > 0) {
+          console.log(chalk.red.bold('  Risk patterns found in this command:'));
+          for (const risk of risks) console.log(`    ${chalk.red('-')} ${risk}`);
+        } else {
+          console.log(chalk.dim('  No known risk patterns matched — this is not a guarantee the command is safe.'));
+        }
         console.log(chalk.dim('  Review the command above manually before approving this package.'));
         continue;
       }
@@ -1205,78 +1344,119 @@ const DEFAULT_TRUSTED_REGISTRIES = [
   'https://registry.yarnpkg.com/',
 ];
 
+interface IntegrityIssue {
+  package: string;
+  issue: string;
+}
+
+/** Locate the lockfile to check, preferring an explicit `--lockfile` choice. */
+function findIntegrityLockfile(
+  projectDir: string,
+  forced: string | undefined,
+): { kind: LockfileKind; path: string } | null {
+  const npmPath    = fs.existsSync(path.join(projectDir, 'package-lock.json'))
+    ? path.join(projectDir, 'package-lock.json')
+    : path.join(projectDir, 'node_modules', '.package-lock.json');
+  const pnpmPath   = path.join(projectDir, 'pnpm-lock.yaml');
+  const yarnPath   = path.join(projectDir, 'yarn.lock');
+
+  if (forced === 'npm') return fs.existsSync(npmPath) ? { kind: 'npm', path: npmPath } : null;
+  if (forced === 'pnpm') return fs.existsSync(pnpmPath) ? { kind: 'pnpm', path: pnpmPath } : null;
+  if (forced === 'yarn') return fs.existsSync(yarnPath) ? { kind: 'yarn', path: yarnPath } : null;
+
+  // auto: prefer whichever lockfile actually exists, npm first (most common).
+  if (fs.existsSync(npmPath)) return { kind: 'npm', path: npmPath };
+  if (fs.existsSync(pnpmPath)) return { kind: 'pnpm', path: pnpmPath };
+  if (fs.existsSync(yarnPath)) return { kind: 'yarn', path: yarnPath };
+  return null;
+}
+
+function readIntegrityEntries(lockfile: { kind: LockfileKind; path: string }): LockfileIntegrityEntry[] {
+  const raw = fs.readFileSync(lockfile.path, 'utf8');
+
+  if (lockfile.kind === 'yarn') return parseYarnLockfile(raw);
+  if (lockfile.kind === 'pnpm') return parsePnpmLockfile(raw);
+
+  // npm: package-lock.json (JSON, lockfileVersion 1 "dependencies" or 2/3 "packages")
+  const pkgLock = JSON.parse(raw) as {
+    packages?: Record<string, { version?: string; resolved?: string; integrity?: string }>;
+    dependencies?: Record<string, { version?: string; resolved?: string; integrity?: string }>;
+  };
+  if (pkgLock.packages) {
+    return Object.entries(pkgLock.packages)
+      .filter(([k]) => k.startsWith('node_modules/') && !k.slice(13).includes('node_modules/'))
+      .map(([k, meta]) => ({ name: k.replace(/^node_modules\//, ''), ...meta }));
+  }
+  return Object.entries(pkgLock.dependencies ?? {}).map(([name, meta]) => ({ name, ...meta }));
+}
+
 program
   .command('integrity')
   .description('Check that all packages were installed from a trusted registry and have integrity hashes')
   .option('-d, --dir <path>', 'Project directory (default: cwd)', process.cwd())
+  .option('--lockfile <kind>', 'Which lockfile to check: auto (default), npm, pnpm, or yarn', 'auto')
   .option('--json', 'Output raw JSON')
-  .action((opts: { dir: string; json: boolean }) => {
+  .action((opts: { dir: string; lockfile: string; json: boolean }) => {
     const projectDir = path.resolve(opts.dir);
     const config               = readConfig(projectDir);
     const trustedRegistries    = [...DEFAULT_TRUSTED_REGISTRIES, ...(config.registries ?? [])];
+    const privateScopes        = config.privateScopes ?? [];
 
-    // Try package-lock.json (npm 7+ v3) or node_modules/.package-lock.json
-    const lockJsonPath = fs.existsSync(path.join(projectDir, 'package-lock.json'))
-      ? path.join(projectDir, 'package-lock.json')
-      : path.join(projectDir, 'node_modules', '.package-lock.json');
-
-    if (!fs.existsSync(lockJsonPath)) {
-      console.error(chalk.red('Error: No package-lock.json found.'));
-      console.error(chalk.dim('  Run `npm install` first to generate a package-lock.json.'));
+    const validLockfileKinds = ['auto', 'npm', 'pnpm', 'yarn'];
+    if (!validLockfileKinds.includes(opts.lockfile)) {
+      console.error(chalk.red(`Error: Invalid --lockfile value "${opts.lockfile}". Valid values: ${validLockfileKinds.join(', ')}`));
       process.exit(2);
     }
 
-    let pkgLock: {
-      packages?: Record<string, { version?: string; resolved?: string; integrity?: string; }>;
-      dependencies?: Record<string, { version?: string; resolved?: string; integrity?: string; }>;
-    };
+    const lockfile = findIntegrityLockfile(projectDir, opts.lockfile === 'auto' ? undefined : opts.lockfile);
+    if (!lockfile) {
+      console.error(chalk.red('Error: No package-lock.json, pnpm-lock.yaml, or yarn.lock found.'));
+      console.error(chalk.dim('  Run `npm install` / `pnpm install` / `yarn install` first.'));
+      process.exit(2);
+    }
 
+    let entries: LockfileIntegrityEntry[];
     try {
-      pkgLock = JSON.parse(fs.readFileSync(lockJsonPath, 'utf8'));
-    } catch {
-      console.error(chalk.red('Error: Could not parse package-lock.json.'));
-      console.error(chalk.dim('  The file may be corrupted. Try deleting it and running `npm install` again.'));
+      entries = readIntegrityEntries(lockfile);
+    } catch (err) {
+      console.error(chalk.red(`Error: Could not parse ${path.basename(lockfile.path)}.`));
+      console.error(chalk.dim(`  ${(err as Error).message}`));
       process.exit(2);
     }
 
-    interface IntegrityIssue {
-      package: string;
-      issue: string;
-    }
     const issues: IntegrityIssue[]    = [];
     const checked: string[]           = [];
 
-    // Support both lockfileVersion 1 (dependencies) and 2/3 (packages)
-    const entries = pkgLock.packages
-      ? Object.entries(pkgLock.packages).filter(([k]) => k.startsWith('node_modules/') && !k.slice(13).includes('node_modules/'))
-      : Object.entries(pkgLock.dependencies ?? {});
-
-    for (const [pkgPath, meta] of entries) {
-      const pkgName = pkgLock.packages
-        ? pkgPath.replace(/^node_modules\//, '')
-        : pkgPath;
-
-      const displayName = meta.version ? `${pkgName}@${meta.version}` : pkgName;
+    for (const entry of entries) {
+      const displayName = entry.version ? `${entry.name}@${entry.version}` : entry.name;
       checked.push(displayName);
 
-      if (!meta.integrity) {
+      if (!entry.integrity) {
         issues.push({ package: displayName, issue: 'missing integrity hash — package may have been installed from a local path or git ref' });
         continue;
       }
 
-      if (meta.resolved && !trustedRegistries.some(registry => meta.resolved!.startsWith(registry))) {
-        issues.push({ package: displayName, issue: `non-registry source: ${meta.resolved}` });
+      if (lockfile.kind !== 'pnpm' && entry.resolved && !trustedRegistries.some(registry => entry.resolved!.startsWith(registry))) {
+        // pnpm-lock.yaml generally omits the registry URL for ordinary registry
+        // packages (only tarball/git/local sources record one) — only npm/yarn
+        // lockfiles always record it, so only those are checked against the allowlist.
+        issues.push({ package: displayName, issue: `non-registry source: ${entry.resolved}` });
+      }
+
+      const matchedScope = privateScopes.find(scope => entry.name.startsWith(scope + '/') || entry.name === scope);
+      if (matchedScope && entry.resolved && trustedRegistries.some(r => r.includes('registry.npmjs.org') && entry.resolved!.startsWith(r))) {
+        issues.push({ package: displayName, issue: `scope confusion: "${matchedScope}" is configured as a private scope but resolved from the public npm registry` });
       }
     }
 
     if (opts.json) {
-      console.log(JSON.stringify({ checked: checked.length, issues }, null, 2));
+      console.log(JSON.stringify({ checked: checked.length, lockfile: lockfile.kind, issues }, null, 2));
       process.exit(issues.length > 0 ? 1 : 0);
     }
 
     console.log('');
     console.log(chalk.bold.underline('Warden Integrity Check'));
-    console.log(`  Checked ${checked.length} packages from ${path.basename(lockJsonPath)}`);
+    console.log(`  Checked ${checked.length} packages from ${path.basename(lockfile.path)}`);
     console.log('');
 
     if (issues.length === 0) {
@@ -1298,7 +1478,14 @@ program
 
 interface CiIntegrityResult { checked: number; issues: Array<{ package: string; issue: string }>; }
 interface CiVerifyResult { ok: boolean; violations: string[]; }
-interface CiAuditResult { total: number; byCapability: Record<string, string[]>; }
+interface CiAuditResult {
+  total: number;
+  byCapability: Record<string, string[]>;
+  lifecycleScriptPackages: string[];
+  unsandboxedPackages: string[];
+  typosquatPackages: string[];
+  evasionPackages: string[];
+}
 
 const CI_HIGH_RISK_CAPS = new Set(['network', 'process-spawn', 'dynamic-code', 'native-binding']);
 
@@ -1306,8 +1493,9 @@ program
   .command('ci')
   .description('Run integrity, verify, and audit together as a single CI gate (one exit code)')
   .option('-d, --dir <path>', 'Project directory (default: cwd)', process.cwd())
+  .option('--strict', 'Also fail on native addons and any declared life-cycle script (not just ones already flagged as risky)')
   .option('--json', 'Output a single machine-readable JSON summary')
-  .action((opts: { dir: string; json: boolean }) => {
+  .action((opts: { dir: string; strict: boolean; json: boolean }) => {
     const projectDir    = path.resolve(opts.dir);
     const cliScript      = process.argv[1];
 
@@ -1316,17 +1504,19 @@ program
       return { status: result.status ?? 2, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
     };
 
-    // integrity only understands package-lock.json today — skip rather than
-    // hard-fail on pnpm/yarn projects instead of blocking the whole gate on it.
-    const hasPackageLock =
+    // Skip the integrity gate entirely when there's no lockfile of any kind for
+    // it to check (`warden integrity` itself understands npm, pnpm, and yarn).
+    const hasAnyLockfile =
       fs.existsSync(path.join(projectDir, 'package-lock.json')) ||
-      fs.existsSync(path.join(projectDir, 'node_modules', '.package-lock.json'));
+      fs.existsSync(path.join(projectDir, 'node_modules', '.package-lock.json')) ||
+      fs.existsSync(path.join(projectDir, 'pnpm-lock.yaml')) ||
+      fs.existsSync(path.join(projectDir, 'yarn.lock'));
 
     let integrityStatus: 'ok' | 'failed' | 'skipped'    = 'skipped';
     let integrityResult: CiIntegrityResult | null       = null;
     let integrityError: string | null                   = null;
 
-    if (hasPackageLock) {
+    if (hasAnyLockfile) {
       const { status, stdout, stderr } = runSubcommand('integrity');
       try {
         integrityResult    = JSON.parse(stdout) as CiIntegrityResult;
@@ -1361,7 +1551,17 @@ program
         ).size
       : 0;
 
-    const ok = integrityStatus !== 'failed' && verifyResult.ok;
+    const strictViolations: string[] = [];
+    if (opts.strict && auditResult) {
+      for (const key of auditResult.unsandboxedPackages) {
+        strictViolations.push(`${key}: native addon (unsandboxed) — not allowed under --strict`);
+      }
+      for (const key of auditResult.lifecycleScriptPackages) {
+        strictViolations.push(`${key}: declares an install-time life-cycle script — not allowed under --strict`);
+      }
+    }
+
+    const ok = integrityStatus !== 'failed' && verifyResult.ok && strictViolations.length === 0;
 
     if (opts.json) {
       console.log(JSON.stringify({
@@ -1369,6 +1569,7 @@ program
         integrity: integrityStatus === 'skipped' ? null : { ok: integrityStatus === 'ok', ...integrityResult, error: integrityError },
         verify: { ...verifyResult, error: verifyError },
         audit: auditResult ? { total: auditResult.total, highRisk: highRiskCount } : null,
+        strict: opts.strict ? { ok: strictViolations.length === 0, violations: strictViolations } : null,
       }, null, 2));
       process.exit(ok ? 0 : 1);
     }
@@ -1378,7 +1579,7 @@ program
     console.log('');
 
     if (integrityStatus === 'skipped') {
-      console.log(`  ${chalk.dim('~')} integrity   ${chalk.dim('skipped — no package-lock.json found (pnpm/yarn lockfiles not supported yet)')}`);
+      console.log(`  ${chalk.dim('~')} integrity   ${chalk.dim('skipped — no package-lock.json, pnpm-lock.yaml, or yarn.lock found')}`);
     } else if (integrityStatus === 'ok') {
       console.log(`  ${chalk.green('+')} integrity   ${chalk.green('ok')} ${chalk.dim(`(${integrityResult?.checked ?? 0} package(s) checked)`)}`);
     } else if (integrityError) {
@@ -1404,6 +1605,17 @@ program
     if (auditResult) {
       const riskLabel = highRiskCount > 0 ? chalk.yellow(`${highRiskCount} high-risk`) : chalk.green('0 high-risk');
       console.log(`  ${chalk.cyan('i')} audit       ${auditResult.total} package(s) scanned, ${riskLabel}`);
+    }
+
+    if (opts.strict) {
+      if (strictViolations.length === 0) {
+        console.log(`  ${chalk.green('+')} strict      ${chalk.green('ok')}`);
+      } else {
+        console.log(`  ${chalk.red('x')} strict      ${chalk.red(`${strictViolations.length} violation(s)`)}`);
+        for (const v of strictViolations) {
+          console.log(`      ${chalk.red('-')} ${v}`);
+        }
+      }
     }
 
     console.log('');
@@ -1459,7 +1671,8 @@ program
       process.exit(1);
     }
 
-    const watchTargets = discoverScanTargets(projectDir);
+    const watchTargets        = discoverScanTargets(projectDir);
+    const typosquatOptions    = buildTyposquatOptions(readConfig(projectDir));
 
     console.log(chalk.bold('\nWarden watch — monitoring node_modules for changes...'));
     if (watchTargets.length > 1) {
@@ -1473,7 +1686,7 @@ program
       console.log(chalk.dim('\n[warden watch] Change detected — rescanning...'));
       try {
         const cache          = buildCacheFromLockfile(currentLock);
-        const results        = await scanProject(projectDir, cache);
+        const results        = await scanProject(projectDir, cache, undefined, true, undefined, typosquatOptions);
         const newPolicies    = buildPolicyMap(results);
         const newLock        = mergeLockfile(null, newPolicies);
 

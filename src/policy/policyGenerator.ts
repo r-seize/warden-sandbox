@@ -43,10 +43,24 @@ export function packageScanResultToPolicy(result: PackageScanResult): PackagePol
     policy.note                = policy.note ? `${policy.note} ${scriptNote}` : scriptNote;
   }
 
+  if (result.lifecycleScriptRisks.length > 0) {
+    policy.lifecycleScriptRisks    = result.lifecycleScriptRisks;
+    const riskNote                 = `Life-cycle script matches risk pattern(s): ${result.lifecycleScriptRisks.join('; ')}.`;
+    policy.note                    = policy.note ? `${policy.note} ${riskNote}` : riskNote;
+    if (policy.status === 'approved') policy.status = 'pending-review';
+  }
+
   if (result.typosquatOf) {
     policy.typosquatOf    = result.typosquatOf;
     const squatNote       = `Package name is one character away from popular package "${result.typosquatOf}" — possible typosquat, verify this is the package you intended to install.`;
     policy.note           = policy.note ? `${policy.note} ${squatNote}` : squatNote;
+    if (policy.status === 'approved') policy.status = 'pending-review';
+  }
+
+  if (result.evasionPatterns.length > 0) {
+    policy.evasionPatterns    = result.evasionPatterns;
+    const evasionNote         = `Code matches evasion pattern(s): ${result.evasionPatterns.join('; ')}.`;
+    policy.note               = policy.note ? `${policy.note} ${evasionNote}` : evasionNote;
     if (policy.status === 'approved') policy.status = 'pending-review';
   }
 

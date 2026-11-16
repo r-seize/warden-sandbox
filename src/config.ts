@@ -13,6 +13,14 @@ export interface WardenConfig {
   /** Extra registry URL prefixes trusted by `warden integrity`, in addition to the
    *  npm and yarn public registries (e.g. a private registry like Verdaccio or Artifactory). */
   registries?: string[];
+  /** Package names never flagged as a typosquat, regardless of edit distance. */
+  typosquatAllowlist?: string[];
+  /** Maximum edit distance considered a typosquat match (default 1). Raising this
+   *  trades precision for recall — expect more false positives. */
+  typosquatMaxDistance?: number;
+  /** Scopes (e.g. "@acme") expected to resolve from a private registry, not the public
+   *  npm registry. Used by `warden integrity` to flag scope confusion. */
+  privateScopes?: string[];
 }
 
 export function readConfig(projectDir: string): WardenConfig {

@@ -19,8 +19,13 @@ export interface PackagePolicy {
   /** npm life-cycle scripts ('preinstall'/'install'/'postinstall') this package declares.
    *  Informational only — these run at install time, before Warden's load-time hooks exist. */
   lifecycleScripts?: string[];
+  /** Static risk-pattern labels matched across the package's life-cycle script commands
+   *  (curl/wget, base64, chmod +x, piping into a shell, ...). See scriptRisk.ts. */
+  lifecycleScriptRisks?: string[];
   /** Set when the package name is a likely one-character typo of a popular package. */
   typosquatOf?: string;
+  /** Static code-obfuscation idioms found in the package's JS. See astEngine.ts / scriptRisk.ts. */
+  evasionPatterns?: string[];
 }
 
 export interface LockfileData {
@@ -79,29 +84,41 @@ export function mergeLockfile(
       continue;
     }
 
-    // A typosquat match that wasn't on the old entry — whether because the name just
-    // started matching (warden's typosquat list grew) or because the lockfile predates
-    // typosquat detection entirely — must force re-review. Checked independently of
-    // the content-hash branch below: the deceptive part of a typosquat is the package
-    // NAME, which doesn't require any code change to newly "become" a problem for an
-    // already-approved entry.
-    const newTyposquat = Boolean(newEntry.typosquatOf) && newEntry.typosquatOf !== oldEntry.typosquatOf;
+    // A typosquat match or a newly-risky life-cycle script that wasn't on the old
+    // entry — whether because warden's detection just grew (a larger typosquat
+    // list, a new risk pattern) or because the lockfile predates the detection
+    // entirely — must force re-review. Checked independently of the content-hash
+    // branch below: both are name/metadata-derived, so they can newly apply to an
+    // already-approved entry without any code change at all.
+    const newTyposquat      = Boolean(newEntry.typosquatOf) && newEntry.typosquatOf !== oldEntry.typosquatOf;
+    const newRiskyScripts   = (newEntry.lifecycleScriptRisks ?? []).filter(
+      r => !(oldEntry.lifecycleScriptRisks ?? []).includes(r),
+    );
+    const newEvasionPatterns = (newEntry.evasionPatterns ?? []).filter(
+      p => !(oldEntry.evasionPatterns ?? []).includes(p),
+    );
+    const newRiskFlagNote = newTyposquat
+      ? `Package name is a likely typosquat of "${newEntry.typosquatOf}" — re-review required.`
+      : newRiskyScripts.length > 0
+      ? `Life-cycle script now matches risk pattern(s): ${newRiskyScripts.join('; ')} — re-review required.`
+      : newEvasionPatterns.length > 0
+      ? `Code matches evasion pattern(s): ${newEvasionPatterns.join('; ')} — re-review required.`
+      : undefined;
+    const newRiskFlag = newTyposquat || newRiskyScripts.length > 0 || newEvasionPatterns.length > 0;
 
     if (oldEntry.contentHash === newEntry.contentHash) {
       // Content unchanged: preserve user policy overrides, status, and note —
-      // unless a new typosquat flag appeared, which forces re-review regardless.
-      const status    = newTyposquat && oldEntry.status !== 'unsandboxed' ? 'pending-review' : oldEntry.status;
-      const note       = newTyposquat
-        ? `Package name is a likely typosquat of "${newEntry.typosquatOf}" — re-review required.`
-        : oldEntry.note;
+      // unless a new risk flag appeared, which forces re-review regardless.
+      const status    = newRiskFlag && oldEntry.status !== 'unsandboxed' ? 'pending-review' : oldEntry.status;
+      const note       = newRiskFlag ? newRiskFlagNote : oldEntry.note;
 
       merged[key] = {
         ...newEntry,
         status,
         note,
-        // Dropped when a new typosquat flag forces re-review: the previous narrow
+        // Dropped when a new risk flag forces re-review: the previous narrow
         // approval was granted without knowing about it.
-        ...(oldEntry.allowedCapabilities && !newTyposquat ? { allowedCapabilities: oldEntry.allowedCapabilities } : {}),
+        ...(oldEntry.allowedCapabilities && !newRiskFlag ? { allowedCapabilities: oldEntry.allowedCapabilities } : {}),
         ...(oldEntry.deniedCapabilities  ? { deniedCapabilities:  oldEntry.deniedCapabilities  } : {}),
       };
       continue;
@@ -110,13 +127,13 @@ export function mergeLockfile(
     // Content changed: detect new capabilities and downgrade status
     const oldCaps      = new Set(oldEntry.capabilities);
     const addedCaps    = newEntry.capabilities.filter(c => !oldCaps.has(c));
-    const forceReview  = addedCaps.length > 0 || newTyposquat;
+    const forceReview  = addedCaps.length > 0 || newRiskFlag;
 
     let note: string | undefined;
     if (addedCaps.length > 0) {
       note = `New capabilities detected after update: ${addedCaps.join(', ')}. Previously approved as: [${oldEntry.capabilities.join(', ') || 'none'}].`;
-    } else if (newTyposquat) {
-      note = `Package name is a likely typosquat of "${newEntry.typosquatOf}" — re-review required.`;
+    } else if (newRiskFlag) {
+      note = newRiskFlagNote;
     } else if (oldEntry.status === 'approved') {
       note = 'Content hash changed (code modified). Re-review recommended.';
     }

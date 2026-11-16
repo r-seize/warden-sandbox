@@ -7,11 +7,13 @@ import { workerData, parentPort } from 'node:worker_threads';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { scanPackage, saveToGlobalCache, ScanCacheEntry, PackageScanResult } from './packageScanner';
+import { TyposquatOptions } from './typosquat';
 
 export interface WorkerInput {
   pkgDirs: string[];
   /** Pre-serialised cache entries, null when the package is not cached. */
   cacheEntries: Array<ScanCacheEntry | null>;
+  typosquatOptions?: TyposquatOptions;
 }
 
 export interface WorkerMessage {
@@ -25,7 +27,7 @@ export interface WorkerMessage {
   cached: boolean;
 }
 
-const { pkgDirs, cacheEntries } = workerData as WorkerInput;
+const { pkgDirs, cacheEntries, typosquatOptions } = workerData as WorkerInput;
 
 for (let i = 0; i < pkgDirs.length; i++) {
   const pkgDir         = pkgDirs[i];
@@ -33,7 +35,7 @@ for (let i = 0; i < pkgDirs.length; i++) {
   const isCached       = cachedEntry !== undefined;
 
   const t0        = Date.now();
-  const result    = scanPackage(pkgDir, cachedEntry);
+  const result    = scanPackage(pkgDir, cachedEntry, typosquatOptions);
   const timeMs    = Date.now() - t0;
 
   if (!isCached) {

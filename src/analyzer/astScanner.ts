@@ -4,12 +4,25 @@ import { Capability } from './capabilityMap';
 export interface FileScanResult {
   capabilities: Set<Capability>;
   unanalyzable: boolean;
+  evasionPatterns: Set<string>;
 }
 
 /** Analyse `source` for capability usage via AST walking (CJS + ESM). */
 export function scanFile(source: string): FileScanResult {
-  const { capabilities, unanalyzable } = analyzeSource(source);
-  return { capabilities, unanalyzable };
+  const { capabilities, unanalyzable, evasionPatterns } = analyzeSource(source);
+  return { capabilities, unanalyzable, evasionPatterns };
+}
+
+/** Regex fallback for evasion idioms, used on files the AST parser couldn't handle. */
+export function scanFileHeuristicEvasion(source: string): Set<string> {
+  const patterns = new Set<string>();
+  if (/Buffer\.from\([^)]*,\s*['"]base64['"]\)\s*\.\s*toString/.test(source)) {
+    patterns.add('base64-decoded string (common obfuscation technique)');
+  }
+  if (/\.\s*constructor\s*\.\s*constructor\s*\(/.test(source)) {
+    patterns.add('indirect Function constructor access (X.constructor.constructor(...))');
+  }
+  return patterns;
 }
 
 /** Regex fallback for minified/obfuscated files that cannot be parsed by Acorn. */

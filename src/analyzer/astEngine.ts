@@ -73,6 +73,13 @@ export interface AnalysisResult {
    */
   evidence: RawEvidence[];
   unanalyzable: boolean;
+  /**
+   * Static code-obfuscation idioms detected (base64-decoded strings feeding a
+   * call, indirect Function constructor access via `.constructor.constructor`).
+   * These are not capabilities with a runtime API to block — just a static
+   * smell worth surfacing, like typosquat or life-cycle script risk patterns.
+   */
+  evasionPatterns: Set<string>;
 }
 
 /**
@@ -88,6 +95,7 @@ export function analyzeSource(source: string, collectEvidence = false): Analysis
     capabilities: new Set<Capability>(),
     evidence: [],
     unanalyzable: false,
+    evasionPatterns: new Set<string>(),
   };
 
   const ast = parseAST(source);
@@ -268,6 +276,33 @@ export function analyzeSource(source: string, collectEvidence = false): Analysis
       if (callee.type === 'Identifier' && (callee as unknown as IdentifierNode).name === 'eval') {
         addCapability('dynamic-code', node.start, node.end);
         return;
+      }
+
+      // Evasion idioms — static code smells, not capabilities with a runtime API
+      // to block. Checked before the generic MemberExpression branches below
+      // since they match specific method names ('toString', 'constructor') those
+      // branches don't otherwise care about.
+      if (callee.type === 'MemberExpression') {
+        const mem    = callee as unknown as MemberExprNode;
+        const prop   = getMemberProp(mem);
+
+        // Buffer.from(<...>, 'base64').toString(...) — decoding an inline blob,
+        // commonly used to hide a require()/import() specifier or other string
+        // from naive static analysis.
+        if (prop === 'toString' && isBase64DecodeCall(mem.object as unknown as AstNode)) {
+          result.evasionPatterns.add('base64-decoded string (common obfuscation technique)');
+        }
+
+        // X.constructor.constructor(...) — indirect access to the Function
+        // constructor, equivalent to `new Function(...)` but written to dodge a
+        // naive search for "Function" or "eval".
+        if (prop === 'constructor') {
+          const obj = mem.object as unknown as AstNode;
+          if (obj.type === 'MemberExpression' && getMemberProp(obj as unknown as MemberExprNode) === 'constructor') {
+            result.evasionPatterns.add('indirect Function constructor access (X.constructor.constructor(...))');
+            addCapability('dynamic-code', node.start, node.end);
+          }
+        }
       }
 
       // Global fetch() — available in Node >= 18 without any import/require.
@@ -570,6 +605,21 @@ function getMemberProp(node: MemberExprNode): string | null {
   if (node.computed) return null;
   const prop = node.property as unknown as AstNode;
   return prop.type === 'Identifier' ? (prop as unknown as IdentifierNode).name : null;
+}
+
+/** Matches `Buffer.from(<anything>, 'base64')`. */
+function isBase64DecodeCall(node: AstNode): boolean {
+  if (node.type !== 'CallExpression') return false;
+  const call      = node as unknown as CallExprNode;
+  const callee    = call.callee as unknown as AstNode;
+  if (callee.type !== 'MemberExpression') return false;
+  const mem    = callee as unknown as MemberExprNode;
+  const obj    = mem.object as unknown as AstNode;
+  if (getMemberProp(mem) !== 'from' || obj.type !== 'Identifier' || (obj as unknown as IdentifierNode).name !== 'Buffer') {
+    return false;
+  }
+  const encodingArg = call.arguments[1] as unknown as AstNode | undefined;
+  return !!encodingArg && encodingArg.type === 'Literal' && (encodingArg as unknown as LiteralNode).value === 'base64';
 }
 
 function trackFsMethod(
