@@ -4,7 +4,7 @@
   "description": "Runtime capability sandboxing for Node.js dependencies",
   "type": "commonjs",
   "bin": {
-    "warden": "./dist/cli.js"
+    "warden": "dist/cli.js"
   },
   "main": "./dist/cli.js",
   "files": [
@@ -28,7 +28,7 @@
   "license": "BSD-3-Clause",
   "repository": {
     "type": "git",
-    "url": "https://github.com/r-seize/warden-sandbox.git"
+    "url": "git+https://github.com/r-seize/warden-sandbox.git"
   },
   "homepage": "https://github.com/r-seize/warden-sandbox#readme",
   "bugs": {
